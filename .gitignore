@@ -149,3 +149,11 @@ eval_reports
 specs/
 docs/superpowers/
 source_documents/packs
+
+# Local scratch: regenerable MCP tool/catalog dumps (token-scope specific, not source)
+/atlassian_mcptools.json
+/mcptools.json
+
+# Baseline / eval capture artifacts (regenerable via baseline.md; may contain
+# internal Confluence content once the Atlassian MCP is wired in)
+/baseline/
