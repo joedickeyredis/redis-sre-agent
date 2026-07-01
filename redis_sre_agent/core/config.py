@@ -51,6 +51,18 @@ class MCPToolConfig(BaseModel):
         description="Optional approval action override for the tool. "
         "If omitted, the agent infers read/write behavior from the tool name and description.",
     )
+    arg_defaults: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Arguments injected into every invocation of this tool at CALL TIME. Use for "
+            "fixed, deployment-specific values the model cannot know (for example account, "
+            "tenant, region, or resource identifiers). String values support ${VAR} "
+            "environment expansion. Defaults are PINNED: they take precedence over the "
+            "value the model supplies. The tool's advertised schema is left unchanged. "
+            "Unresolved ${VAR} placeholders and empty string values are skipped, leaving "
+            "the model-supplied value as the fallback."
+        ),
+    )
 
 
 class MCPServerConfig(BaseModel):

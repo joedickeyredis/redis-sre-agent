@@ -1,8 +1,9 @@
 """Unit tests for MCP tool provider."""
 
+import os
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -227,6 +228,187 @@ class TestMCPToolProvider:
         provider = MCPToolProvider(server_name="test", server_config=config)
 
         assert provider._get_tool_config("any_tool") is None
+
+    def test_apply_arg_defaults_noop_when_not_configured(self):
+        """A tool with no config entry returns args unchanged."""
+        config = MCPServerConfig(command="test")
+        provider = MCPToolProvider(server_name="test", server_config=config)
+
+        assert provider._apply_arg_defaults("any_tool", {"query": "x"}) == {"query": "x"}
+
+    def test_apply_arg_defaults_noop_when_tool_has_no_arg_defaults(self):
+        """A configured tool without arg_defaults returns args unchanged."""
+        config = MCPServerConfig(command="test", tools={"searchAtlassian": MCPToolConfig()})
+        provider = MCPToolProvider(server_name="test", server_config=config)
+
+        assert provider._apply_arg_defaults("searchAtlassian", {"query": "x"}) == {"query": "x"}
+
+    def test_apply_arg_defaults_injects_static_value_when_missing(self):
+        """A static default is injected when the model omits it."""
+        config = MCPServerConfig(
+            command="test",
+            tools={"searchAtlassian": MCPToolConfig(arg_defaults={"cloudId": "abc"})},
+        )
+        provider = MCPToolProvider(server_name="test", server_config=config)
+
+        assert provider._apply_arg_defaults("searchAtlassian", {"query": "x"}) == {
+            "query": "x",
+            "cloudId": "abc",
+        }
+
+    def test_apply_arg_defaults_expands_env_var(self):
+        """A ${VAR} default is expanded from the environment."""
+        config = MCPServerConfig(
+            command="test",
+            tools={
+                "searchAtlassian": MCPToolConfig(
+                    arg_defaults={"cloudId": "${TEST_ARG_DEFAULT_CLOUD_ID}"}
+                )
+            },
+        )
+        provider = MCPToolProvider(server_name="test", server_config=config)
+
+        with patch.dict("os.environ", {"TEST_ARG_DEFAULT_CLOUD_ID": "cloud-123"}, clear=False):
+            result = provider._apply_arg_defaults("searchAtlassian", {"query": "x"})
+
+        assert result["cloudId"] == "cloud-123"
+
+    def test_apply_arg_defaults_pins_over_model_value(self):
+        """A resolvable default overrides a model-supplied value (pinned)."""
+        config = MCPServerConfig(
+            command="test",
+            tools={"searchAtlassian": MCPToolConfig(arg_defaults={"cloudId": "config-value"})},
+        )
+        provider = MCPToolProvider(server_name="test", server_config=config)
+
+        result = provider._apply_arg_defaults(
+            "searchAtlassian", {"cloudId": "model-guess", "query": "x"}
+        )
+
+        assert result["cloudId"] == "config-value"
+        assert result["query"] == "x"
+
+    def test_apply_arg_defaults_skips_unresolved_var_preserves_model_value(self):
+        """An unresolved ${VAR} is skipped so the model-supplied value survives."""
+        config = MCPServerConfig(
+            command="test",
+            tools={
+                "searchAtlassian": MCPToolConfig(
+                    arg_defaults={"cloudId": "${TEST_ARG_DEFAULT_MISSING}"}
+                )
+            },
+        )
+        provider = MCPToolProvider(server_name="test", server_config=config)
+
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("TEST_ARG_DEFAULT_MISSING", None)
+            result = provider._apply_arg_defaults("searchAtlassian", {"cloudId": "model-guess"})
+
+        assert result["cloudId"] == "model-guess"
+
+    def test_apply_arg_defaults_skips_unresolved_var_leaves_key_absent(self):
+        """An unresolved ${VAR} never injects a literal placeholder."""
+        config = MCPServerConfig(
+            command="test",
+            tools={
+                "searchAtlassian": MCPToolConfig(
+                    arg_defaults={"cloudId": "${TEST_ARG_DEFAULT_MISSING}"}
+                )
+            },
+        )
+        provider = MCPToolProvider(server_name="test", server_config=config)
+
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("TEST_ARG_DEFAULT_MISSING", None)
+            result = provider._apply_arg_defaults("searchAtlassian", {"query": "x"})
+
+        assert result == {"query": "x"}
+        assert "cloudId" not in result
+
+    def test_apply_arg_defaults_skips_empty_string_value(self):
+        """A default that resolves to an empty string is skipped."""
+        config = MCPServerConfig(
+            command="test",
+            tools={
+                "searchAtlassian": MCPToolConfig(
+                    arg_defaults={"cloudId": "${TEST_ARG_DEFAULT_EMPTY}"}
+                )
+            },
+        )
+        provider = MCPToolProvider(server_name="test", server_config=config)
+
+        with patch.dict("os.environ", {"TEST_ARG_DEFAULT_EMPTY": ""}, clear=False):
+            result = provider._apply_arg_defaults("searchAtlassian", {"query": "x"})
+
+        assert "cloudId" not in result
+
+    def test_apply_arg_defaults_skips_embedded_unresolved_placeholder(self):
+        """An embedded unresolved ${VAR} (not whole-string) is also skipped."""
+        config = MCPServerConfig(
+            command="test",
+            tools={
+                "searchAtlassian": MCPToolConfig(
+                    arg_defaults={"path": "a-${TEST_ARG_DEFAULT_MISSING}-b"}
+                )
+            },
+        )
+        provider = MCPToolProvider(server_name="test", server_config=config)
+
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("TEST_ARG_DEFAULT_MISSING", None)
+            result = provider._apply_arg_defaults("searchAtlassian", {"query": "x"})
+
+        assert "path" not in result
+
+    def test_apply_arg_defaults_passes_through_non_string_values(self):
+        """Non-string defaults are injected verbatim (no expansion attempted)."""
+        config = MCPServerConfig(
+            command="test",
+            tools={"searchAtlassian": MCPToolConfig(arg_defaults={"limit": 10, "flag": True})},
+        )
+        provider = MCPToolProvider(server_name="test", server_config=config)
+
+        result = provider._apply_arg_defaults("searchAtlassian", {"query": "x"})
+
+        assert result["limit"] == 10
+        assert result["flag"] is True
+
+    def test_apply_arg_defaults_handles_multiple_keys_independently(self):
+        """A resolvable key is injected while an unresolved one is skipped."""
+        config = MCPServerConfig(
+            command="test",
+            tools={
+                "searchAtlassian": MCPToolConfig(
+                    arg_defaults={
+                        "cloudId": "${TEST_ARG_DEFAULT_CLOUD_ID}",
+                        "region": "${TEST_ARG_DEFAULT_MISSING}",
+                    }
+                )
+            },
+        )
+        provider = MCPToolProvider(server_name="test", server_config=config)
+
+        with patch.dict("os.environ", {"TEST_ARG_DEFAULT_CLOUD_ID": "cloud-123"}, clear=False):
+            os.environ.pop("TEST_ARG_DEFAULT_MISSING", None)
+            result = provider._apply_arg_defaults("searchAtlassian", {"query": "x"})
+
+        assert result["cloudId"] == "cloud-123"
+        assert "region" not in result
+
+    def test_apply_arg_defaults_does_not_mutate_input_args(self):
+        """The input args dict is not mutated; a new dict is returned."""
+        config = MCPServerConfig(
+            command="test",
+            tools={"searchAtlassian": MCPToolConfig(arg_defaults={"cloudId": "abc"})},
+        )
+        provider = MCPToolProvider(server_name="test", server_config=config)
+        original = {"query": "x"}
+
+        result = provider._apply_arg_defaults("searchAtlassian", original)
+
+        assert original == {"query": "x"}
+        assert result is not original
+        assert result["cloudId"] == "abc"
 
 
 class TestMCPToolProviderAsync:
@@ -518,3 +700,96 @@ class TestMCPToolProviderAsync:
             "url": "http://afs-gateway.example/mcp",
             "headers": {"Authorization": "Bearer secret-token"},
         }
+
+    def test_create_tool_schemas_keeps_required_args_with_arg_defaults(self):
+        """arg_defaults must NOT remove pinned keys from the advertised schema."""
+        config = MCPServerConfig(
+            command="test",
+            tools={
+                "searchConfluenceUsingCql": MCPToolConfig(
+                    arg_defaults={"cloudId": "${TEST_ARG_DEFAULT_CLOUD_ID}"}
+                )
+            },
+        )
+        provider = MCPToolProvider(server_name="atlassian_rovo_mcp", server_config=config)
+        provider._mcp_tools = [
+            SimpleNamespace(
+                name="searchConfluenceUsingCql",
+                description="Search Confluence via CQL",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "cloudId": {"type": "string"},
+                        "cql": {"type": "string"},
+                    },
+                    "required": ["cloudId", "cql"],
+                },
+            )
+        ]
+
+        schemas = provider.create_tool_schemas()
+
+        assert len(schemas) == 1
+        params = schemas[0].parameters
+        assert "cloudId" in params["properties"]
+        assert "cloudId" in params["required"]
+        assert "cql" in params["required"]
+
+    @pytest.mark.asyncio
+    async def test_tool_invoke_applies_arg_defaults(self):
+        """The LLM-facing tool.invoke path resolves the raw tool name and injects arg_defaults.
+
+        This drives the full production chain - tools() builds the mangled
+        ``mcp_{server}_{hash}_{op}`` schema name, resolve_operation reverses it back to
+        the raw ``searchAtlassian`` key, and only then does _get_tool_config match and
+        _apply_arg_defaults inject. Calling _call_mcp_tool directly would bypass that
+        resolution and hide a name-mismatch regression.
+        """
+        config = MCPServerConfig(
+            command="test",
+            tools={
+                "searchAtlassian": MCPToolConfig(
+                    arg_defaults={"cloudId": "${TEST_ARG_DEFAULT_CLOUD_ID}"}
+                )
+            },
+        )
+        provider = MCPToolProvider(server_name="atlassian_rovo_mcp", server_config=config)
+        provider._mcp_tools = [
+            SimpleNamespace(
+                name="searchAtlassian",
+                description="Rovo cross-product search",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "cloudId": {"type": "string"},
+                        "query": {"type": "string"},
+                    },
+                    "required": ["cloudId", "query"],
+                },
+            )
+        ]
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=SimpleNamespace(
+                isError=False,
+                structuredContent={"ok": True},
+                content=[],
+            )
+        )
+        provider._session = mock_session
+
+        tools = provider.tools()
+        assert len(tools) == 1
+        # The LLM-facing name is the mangled schema name, not the raw operation.
+        assert tools[0].definition.name.endswith("_searchAtlassian")
+
+        with patch.dict("os.environ", {"TEST_ARG_DEFAULT_CLOUD_ID": "cloud-123"}, clear=False):
+            result = await tools[0].invoke({"query": "redis"})
+
+        assert result["status"] == "success"
+        mock_session.call_tool.assert_awaited_once()
+        call_args, call_kwargs = mock_session.call_tool.call_args
+        # resolve_operation recovered the raw name that _get_tool_config keys on.
+        assert call_args[0] == "searchAtlassian"
+        assert call_kwargs["arguments"] == {"query": "redis", "cloudId": "cloud-123"}

@@ -7,6 +7,7 @@ overrides based on the MCPServerConfig.
 
 import logging
 import os
+import re
 from contextlib import AsyncExitStack
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -32,6 +33,10 @@ if TYPE_CHECKING:
     from redis_sre_agent.core.instances import RedisInstance
 
 logger = logging.getLogger(__name__)
+
+# Matches an unresolved ${VAR} placeholder left behind when os.path.expandvars
+# cannot resolve an environment variable (i.e. it is unset).
+_UNRESOLVED_VAR_RE = re.compile(r"\$\{[^}]*\}")
 
 
 def _coerce_input_schema_dict(input_schema: Any) -> Optional[Dict[str, Any]]:
@@ -449,6 +454,47 @@ class MCPToolProvider(ToolProvider):
         self._tool_cache = tools
         return tools
 
+    def _apply_arg_defaults(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Inject configured ``arg_defaults`` into a tool call at invocation time.
+
+        This does NOT modify the tool's advertised schema - the arguments the MCP
+        server declared (including ``required``) are left intact. Configured defaults
+        are applied here, per-call, for fixed deployment values (e.g. account/tenant/
+        region/resource ids) the model cannot know. String values support ${VAR}
+        environment expansion; entries that are empty or still contain an unresolved
+        ${VAR} placeholder are skipped (and logged) so a literal placeholder is never
+        sent, and the model's own value is left as the fallback in that case.
+
+        Configured defaults take precedence over the model-supplied value because they
+        represent pinned deployment configuration; each override is logged for
+        traceability.
+        """
+        config = self._get_tool_config(tool_name)
+        if not config or not config.arg_defaults:
+            return args
+
+        merged = dict(args or {})
+        for key, value in config.arg_defaults.items():
+            resolved = os.path.expandvars(value) if isinstance(value, str) else value
+            if isinstance(resolved, str) and (
+                resolved == "" or _UNRESOLVED_VAR_RE.search(resolved)
+            ):
+                logger.warning(
+                    "Skipping arg_default '%s' for tool '%s': value is empty or has an "
+                    "unresolved ${VAR} placeholder; using the model-supplied value (if any).",
+                    key,
+                    tool_name,
+                )
+                continue
+            if key in merged and merged[key] != resolved:
+                logger.debug(
+                    "Overriding model-supplied '%s' for tool '%s' with configured arg_default.",
+                    key,
+                    tool_name,
+                )
+            merged[key] = resolved
+        return merged
+
     async def _call_mcp_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
         """Call an MCP tool on the server.
 
@@ -464,6 +510,8 @@ class MCPToolProvider(ToolProvider):
                 "status": "error",
                 "error": f"MCP server '{self._server_name}' is not connected",
             }
+
+        args = self._apply_arg_defaults(tool_name, args)
 
         try:
             logger.info(f"Calling MCP tool '{tool_name}' with args: {args}")

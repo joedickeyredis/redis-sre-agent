@@ -79,19 +79,29 @@ mcp_servers:
     # createJiraIssue, editJiraIssue, transitionJiraIssue, ...) is filtered out.
     # capability: knowledge -> surfaces them under the knowledge category and
     # makes them default to read (auto-allow, no approval prompts).
+    # arg_defaults.cloudId is pinned from ATLASSIAN_CLOUD_ID (.env) and injected at
+    # call time (overriding the model's value), so cloudId is set on every call.
     tools:
       searchAtlassian:
         capability: knowledge
         action_kind: read
+        arg_defaults:
+          cloudId: ${ATLASSIAN_CLOUD_ID}
       fetchAtlassian:
         capability: knowledge
         action_kind: read
+        arg_defaults:
+          cloudId: ${ATLASSIAN_CLOUD_ID}
       searchConfluenceUsingCql:
         capability: knowledge
         action_kind: read
+        arg_defaults:
+          cloudId: ${ATLASSIAN_CLOUD_ID}
       getConfluencePage:
         capability: knowledge
         action_kind: read
+        arg_defaults:
+          cloudId: ${ATLASSIAN_CLOUD_ID}
 
 # Manually overriding tool providers configuration (fully qualified class paths).
 # Useful to disable some built-in tool providers and/or enable your own custom providers.
