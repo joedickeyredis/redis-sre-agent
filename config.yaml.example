@@ -63,6 +63,35 @@ mcp_servers:
         capability: repos
       get_commit:
         capability: repos
+  # Atlassian MCP server for Confluence knowledge base search
+  # Remote streamable-HTTP transport with non-interactive API-token (Basic) auth.
+  # ATLASSIAN_MCP_BASIC_AUTH = base64("email:api_token"); set it in .env.
+  # The token must have Confluence read + search scopes, or tools/list returns
+  # only the getTeamworkGraph* tools. No `tools:` block = expose the full
+  # tools/list (add a read whitelist before running agent queries).
+  atlassian_rovo_mcp:
+    url: "https://mcp.atlassian.com/v1/mcp"
+    headers:
+      Authorization: "Basic ${ATLASSIAN_MCP_BASIC_AUTH}"
+    transport: streamable_http
+    # Read whitelist: only these 4 search/fetch tools are exposed to the agent.
+    # Every Atlassian write tool (createConfluencePage, updateConfluencePage,
+    # createJiraIssue, editJiraIssue, transitionJiraIssue, ...) is filtered out.
+    # capability: knowledge -> surfaces them under the knowledge category and
+    # makes them default to read (auto-allow, no approval prompts).
+    tools:
+      searchAtlassian:
+        capability: knowledge
+        action_kind: read
+      fetchAtlassian:
+        capability: knowledge
+        action_kind: read
+      searchConfluenceUsingCql:
+        capability: knowledge
+        action_kind: read
+      getConfluencePage:
+        capability: knowledge
+        action_kind: read
 
 # Manually overriding tool providers configuration (fully qualified class paths).
 # Useful to disable some built-in tool providers and/or enable your own custom providers.
