@@ -381,12 +381,19 @@ class MCPToolProvider(ToolProvider):
             # Get capability (with potential override)
             capability = self._get_capability(tool_name)
 
-            # Build parameters schema from MCP tool input schema
+            # Build parameters schema from MCP tool input schema.
+            # Keys that have a resolvable arg_default are stripped from the advertised
+            # schema (properties + required): they are pinned deployment values injected
+            # at call time, so exposing them only causes the model to stall asking the
+            # user for a value it cannot know (e.g. Atlassian cloudId).
             input_schema = _coerce_input_schema_dict(mcp_tool.inputSchema) or {}
+            input_schema = self._strip_pinned_keys(
+                input_schema, self._resolved_arg_default_keys(tool_name)
+            )
             parameters = {
                 "type": "object",
-                "properties": input_schema.get("properties", {}),
-                "required": input_schema.get("required", []),
+                "properties": input_schema.get("properties") or {},
+                "required": input_schema.get("required") or [],
             }
 
             schema = ToolDefinition(
@@ -410,7 +417,9 @@ class MCPToolProvider(ToolProvider):
 
             input_schema = _coerce_input_schema_dict(getattr(mcp_tool, "inputSchema", None))
             if input_schema is not None:
-                schemas[tool_name] = input_schema
+                schemas[tool_name] = self._strip_pinned_keys(
+                    input_schema, self._resolved_arg_default_keys(tool_name)
+                )
 
         return schemas
 
@@ -454,6 +463,61 @@ class MCPToolProvider(ToolProvider):
         self._tool_cache = tools
         return tools
 
+    @staticmethod
+    def _resolve_arg_default(value: Any) -> Any:
+        """Resolve a single arg_default value, or return ``None`` if it should be skipped.
+
+        String values undergo ${VAR} environment expansion. A resolved value is skipped
+        (returns ``None``) when it is an empty string or still contains an unresolved
+        ${VAR} placeholder, so a literal placeholder is never used and the model-supplied
+        value can serve as the fallback. Non-string values pass through verbatim.
+        """
+        if not isinstance(value, str):
+            return value
+        resolved = os.path.expandvars(value)
+        if resolved == "" or _UNRESOLVED_VAR_RE.search(resolved):
+            return None
+        return resolved
+
+    def _resolved_arg_default_keys(self, tool_name: str) -> set:
+        """Return the arg_default keys for a tool whose values resolve to a concrete value.
+
+        These keys are pinned deployment config injected at call time, so they are
+        stripped from the advertised schema. Keys with unresolved/empty defaults are
+        NOT included, so they remain visible for the model to supply as a fallback.
+        """
+        config = self._get_tool_config(tool_name)
+        if not config or not config.arg_defaults:
+            return set()
+        return {
+            key
+            for key, value in config.arg_defaults.items()
+            if self._resolve_arg_default(value) is not None
+        }
+
+    @staticmethod
+    def _strip_pinned_keys(schema: Dict[str, Any], pinned_keys: set) -> Dict[str, Any]:
+        """Return a copy of ``schema`` with ``pinned_keys`` removed from properties + required.
+
+        Pinned keys are arg_defaults that resolve to a concrete value; they are injected
+        at call time, so they are hidden from the advertised schema to stop the model from
+        stalling to ask the user for a value it cannot know. The rest of the raw schema
+        (title, additionalProperties, ...) is preserved. Returns the input unchanged when
+        there are no pinned keys.
+        """
+        if not pinned_keys:
+            return schema
+        result = dict(schema)
+        if isinstance(result.get("properties"), dict):
+            result["properties"] = {
+                key: value
+                for key, value in result["properties"].items()
+                if key not in pinned_keys
+            }
+        if isinstance(result.get("required"), list):
+            result["required"] = [key for key in result["required"] if key not in pinned_keys]
+        return result
+
     def _apply_arg_defaults(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Inject configured ``arg_defaults`` into a tool call at invocation time.
 
@@ -475,10 +539,8 @@ class MCPToolProvider(ToolProvider):
 
         merged = dict(args or {})
         for key, value in config.arg_defaults.items():
-            resolved = os.path.expandvars(value) if isinstance(value, str) else value
-            if isinstance(resolved, str) and (
-                resolved == "" or _UNRESOLVED_VAR_RE.search(resolved)
-            ):
+            resolved = self._resolve_arg_default(value)
+            if resolved is None:
                 logger.warning(
                     "Skipping arg_default '%s' for tool '%s': value is empty or has an "
                     "unresolved ${VAR} placeholder; using the model-supplied value (if any).",

@@ -79,8 +79,10 @@ mcp_servers:
     # createJiraIssue, editJiraIssue, transitionJiraIssue, ...) is filtered out.
     # capability: knowledge -> surfaces them under the knowledge category and
     # makes them default to read (auto-allow, no approval prompts).
-    # arg_defaults.cloudId is pinned from ATLASSIAN_CLOUD_ID (.env) and injected at
-    # call time (overriding the model's value), so cloudId is set on every call.
+    # arg_defaults.cloudId is pinned from ATLASSIAN_CLOUD_ID (.env). When it resolves
+    # to a concrete value, cloudId is stripped from the tool's advertised schema (so the
+    # model never sees it and won't stall asking the user for it) and injected at call
+    # time, so cloudId is set on every call.
     tools:
       searchAtlassian:
         capability: knowledge

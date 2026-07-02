@@ -58,9 +58,12 @@ class MCPToolConfig(BaseModel):
             "fixed, deployment-specific values the model cannot know (for example account, "
             "tenant, region, or resource identifiers). String values support ${VAR} "
             "environment expansion. Defaults are PINNED: they take precedence over the "
-            "value the model supplies. The tool's advertised schema is left unchanged. "
-            "Unresolved ${VAR} placeholders and empty string values are skipped, leaving "
-            "the model-supplied value as the fallback."
+            "value the model supplies. When a default resolves to a concrete value, its "
+            "key is stripped from the tool's advertised schema (properties + required) so "
+            "the model never sees it and cannot stall asking the user for a value it "
+            "cannot know. Unresolved ${VAR} placeholders and empty string values are "
+            "skipped: the key stays in the schema and the model-supplied value is used as "
+            "the fallback."
         ),
     )
 

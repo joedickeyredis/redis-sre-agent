@@ -701,8 +701,13 @@ class TestMCPToolProviderAsync:
             "headers": {"Authorization": "Bearer secret-token"},
         }
 
-    def test_create_tool_schemas_keeps_required_args_with_arg_defaults(self):
-        """arg_defaults must NOT remove pinned keys from the advertised schema."""
+    def test_create_tool_schemas_strips_resolved_arg_default_from_schema(self):
+        """A resolvable arg_default key is stripped from the advertised schema.
+
+        The model must not see a pinned deployment value (e.g. cloudId); otherwise it
+        stalls asking the user for a value it cannot know. The value is injected at call
+        time instead (see test_tool_invoke_applies_arg_defaults).
+        """
         config = MCPServerConfig(
             command="test",
             tools={
@@ -727,7 +732,46 @@ class TestMCPToolProviderAsync:
             )
         ]
 
-        schemas = provider.create_tool_schemas()
+        with patch.dict("os.environ", {"TEST_ARG_DEFAULT_CLOUD_ID": "cloud-123"}, clear=False):
+            schemas = provider.create_tool_schemas()
+
+        assert len(schemas) == 1
+        params = schemas[0].parameters
+        assert "cloudId" not in params["properties"]
+        assert "cloudId" not in params["required"]
+        # Non-pinned args are untouched.
+        assert "cql" in params["properties"]
+        assert "cql" in params["required"]
+
+    def test_create_tool_schemas_keeps_unresolved_arg_default_in_schema(self):
+        """An unresolved ${VAR} arg_default is NOT stripped, so the model can supply it."""
+        config = MCPServerConfig(
+            command="test",
+            tools={
+                "searchConfluenceUsingCql": MCPToolConfig(
+                    arg_defaults={"cloudId": "${TEST_ARG_DEFAULT_MISSING}"}
+                )
+            },
+        )
+        provider = MCPToolProvider(server_name="atlassian_rovo_mcp", server_config=config)
+        provider._mcp_tools = [
+            SimpleNamespace(
+                name="searchConfluenceUsingCql",
+                description="Search Confluence via CQL",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "cloudId": {"type": "string"},
+                        "cql": {"type": "string"},
+                    },
+                    "required": ["cloudId", "cql"],
+                },
+            )
+        ]
+
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("TEST_ARG_DEFAULT_MISSING", None)
+            schemas = provider.create_tool_schemas()
 
         assert len(schemas) == 1
         params = schemas[0].parameters
