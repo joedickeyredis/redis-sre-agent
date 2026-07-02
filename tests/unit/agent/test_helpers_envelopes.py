@@ -51,6 +51,32 @@ def test_build_result_envelope_no_tool_def():
 
     assert env["tool_key"] == "unknown.tool"
     assert env["description"] is None
+    assert env["capability"] is None
+
+
+def test_build_result_envelope_sets_capability_from_tooldef():
+    """Capability from the tool definition is stored as its string value on the envelope."""
+    from redis_sre_agent.tools.models import ToolCapability
+
+    tool_name = "mcp_atlassian_rovo_mcp_abc123_searchConfluenceUsingCql"
+    msg = ToolMessage(content='{"results": []}', tool_call_id="abc")
+
+    class _CapToolDef:
+        description = "Search Confluence"
+        capability = ToolCapability.KNOWLEDGE
+
+    env = build_result_envelope(tool_name, {}, msg, {tool_name: _CapToolDef()})
+
+    assert env["capability"] == "knowledge"
+
+
+def test_build_result_envelope_capability_none_when_tooldef_lacks_it():
+    """A tool def without a capability attribute yields capability None (non-breaking)."""
+    tool_name = "knowledge.kb.search"
+    msg = ToolMessage(content='{"results": []}', tool_call_id="abc")
+    env = build_result_envelope(tool_name, {}, msg, {tool_name: _ToolDef(description="Search")})
+
+    assert env["capability"] is None
 
 
 def test_build_result_envelope_empty_tool_name():

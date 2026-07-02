@@ -107,6 +107,43 @@ class TestExtractCitations:
 
         assert len(citations) == 0
 
+    def test_extract_citations_matches_by_capability_when_tool_key_lacks_knowledge(self):
+        """MCP knowledge tools (e.g. Confluence) match via capability, not tool_key.
+
+        Their generated tool_key does not contain the word "knowledge", so the OR
+        branch on capability == KNOWLEDGE is what lets their results become citations.
+        """
+        envelopes = [
+            {
+                "tool_key": "mcp_atlassian_rovo_mcp_abc123_searchConfluenceUsingCql",
+                "name": "searchConfluenceUsingCql",
+                "capability": "knowledge",
+                "status": "success",
+                "data": {"results": [{"title": "Shaka Runbook", "source": "confluence"}]},
+            }
+        ]
+
+        citations = extract_citations(envelopes)
+
+        assert len(citations) == 1
+        assert citations[0]["title"] == "Shaka Runbook"
+
+    def test_extract_citations_ignores_non_knowledge_capability(self):
+        """A non-knowledge capability whose tool_key lacks 'knowledge' is ignored."""
+        envelopes = [
+            {
+                "tool_key": "mcp_prom_abc_query_metrics",
+                "name": "query_metrics",
+                "capability": "metrics",
+                "status": "success",
+                "data": {"results": [{"title": "should not appear"}]},
+            }
+        ]
+
+        citations = extract_citations(envelopes)
+
+        assert len(citations) == 0
+
     def test_extract_citations_empty_envelopes(self):
         """Test with empty envelopes list."""
         citations = extract_citations([])
@@ -327,6 +364,24 @@ class TestAgentResponseSearchResults:
 
         assert len(response.search_results) == 1
         assert response.search_results[0]["retrieval_kind"] == "pinned_context"
+
+    def test_search_results_derived_via_capability_gate(self):
+        """End-to-end: an MCP knowledge envelope surfaces as a citation via capability."""
+        response = AgentResponse(
+            response="Test response",
+            tool_envelopes=[
+                {
+                    "tool_key": "mcp_atlassian_rovo_mcp_abc_searchConfluenceUsingCql",
+                    "name": "searchConfluenceUsingCql",
+                    "capability": "knowledge",
+                    "status": "success",
+                    "data": {"results": [{"title": "Confluence Doc", "source": "confluence"}]},
+                }
+            ],
+        )
+
+        assert len(response.search_results) == 1
+        assert response.search_results[0]["title"] == "Confluence Doc"
 
     def test_search_results_empty_when_no_knowledge_tools(self):
         """Test that search_results is empty when no knowledge tools used."""

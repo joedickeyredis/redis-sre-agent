@@ -31,6 +31,12 @@ class ResultEnvelope(BaseModel):
     tool_key: str = Field(..., description="Fully-qualified tool name used to route the call")
     name: Optional[str] = Field(None, description="Short operation name if available")
     description: Optional[str] = Field(None, description="Tool description shown to the LLM")
+    capability: Optional[str] = Field(
+        None,
+        description="Tool capability category (e.g. 'knowledge', 'metrics') taken from the "
+        "tool definition. Lets downstream consumers route envelopes without parsing the "
+        "tool_key (e.g. citation extraction of knowledge results).",
+    )
     args: Dict[str, Any] = Field(default_factory=dict)
     status: str = Field(..., description="'success' or 'error'")
     data: Dict[str, Any] = Field(

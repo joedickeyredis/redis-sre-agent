@@ -101,6 +101,7 @@ test-eval-pr: sync ## Run the deterministic eval subset used in PR CI
 		tests/unit/cli/test_cli_eval.py \
 		tests/unit/evaluation/test_agent_only_runtime.py \
 		tests/unit/evaluation/test_assertions.py \
+		tests/unit/evaluation/test_confluence_citation_eval.py \
 		tests/unit/evaluation/test_fixture_layout.py \
 		tests/unit/evaluation/test_injection.py \
 		tests/unit/evaluation/test_judge.py \

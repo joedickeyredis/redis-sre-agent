@@ -283,6 +283,11 @@ def build_result_envelope(
 
     tdef = tooldefs_by_name.get(tool_name) if tool_name else None
     description = tdef.description if tdef else None
+    # Capability comes off the tool definition as a ToolCapability enum; store its
+    # string value so the envelope stays JSON-serializable. Tolerates a plain string
+    # or a missing/None capability (getattr default).
+    capability = getattr(tdef, "capability", None)
+    capability_value = getattr(capability, "value", capability)
     raw_status = (
         str(data_obj.get("status")).lower()
         if isinstance(data_obj, dict) and data_obj.get("status") is not None
@@ -293,6 +298,7 @@ def build_result_envelope(
         tool_key=tool_name or "tool",
         name=_extract_operation_from_tool_name(tool_name or "tool"),
         description=description,
+        capability=capability_value if isinstance(capability_value, str) else None,
         args=dict(tool_args or {}),
         status=envelope_status,
         data=data_obj if isinstance(data_obj, dict) else {"raw": (content or "")[:4000]},
@@ -415,14 +421,22 @@ def extract_citations(envelopes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         List of citation dicts extracted from knowledge tool results.
         Each citation preserves all fields from the original search result.
     """
+    from redis_sre_agent.tools.models import ToolCapability
+
+    knowledge_capability = ToolCapability.KNOWLEDGE.value
+
     citations: List[Dict[str, Any]] = []
 
     for envelope in envelopes:
         tool_key = envelope.get("tool_key", "")
         name = str(envelope.get("name", ""))
+        capability = str(envelope.get("capability", "")).strip().lower()
 
-        # Match knowledge search tools by tool_key containing "knowledge"
-        if "knowledge" not in tool_key.lower():
+        # Match knowledge tools by tool_key containing "knowledge" OR by an explicit
+        # KNOWLEDGE capability. The capability check covers tools (e.g. MCP-backed
+        # Confluence search) whose generated tool_key does not contain the word
+        # "knowledge" but are declared as knowledge sources in config.
+        if "knowledge" not in tool_key.lower() and capability != knowledge_capability:
             continue
 
         # Extract results from the data field
