@@ -137,6 +137,19 @@ const buildKnowledgeDocumentPath = (
   return `/knowledge/document-chunks/${encodeURIComponent(docHash)}${suffix}${anchor}`;
 };
 
+const HTTP_URL_PATTERN = /^https?:\/\//i;
+
+// Pick the first value that is an absolute http(s) URL. Used to link citations
+// from external knowledge sources (e.g. a Confluence page) that are not indexed
+// in the local knowledge base and therefore have no internal document_hash route.
+const externalCitationUrl = (...values: unknown[]): string | undefined => {
+  for (const value of values) {
+    const url = String(value ?? "").trim();
+    if (HTTP_URL_PATTERN.test(url)) return url;
+  }
+  return undefined;
+};
+
 interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "tool" | "system" | "status";
@@ -149,6 +162,7 @@ interface CitationDisplayItem {
   key: string;
   title: string;
   to?: string;
+  href?: string;
 }
 
 interface ChatThread {
@@ -412,17 +426,23 @@ const Triage = () => {
           String(citation.document_hash || citation.id || "Untitled chunk");
         const documentHash = citation.document_hash;
         const chunkIndex = citation.chunk_index;
+        const to = buildKnowledgeDocumentPath(
+          documentHash,
+          chunkIndex,
+          citation.version,
+        );
         return {
           key: String(
             citation.id ||
               `${documentHash || "citation"}-${chunkIndex ?? index}`,
           ),
           title,
-          to: buildKnowledgeDocumentPath(
-            documentHash,
-            chunkIndex,
-            citation.version,
-          ),
+          to,
+          // Fall back to an external page link (e.g. Confluence) only when there
+          // is no internal knowledge-base route to prefer.
+          href: to
+            ? undefined
+            : externalCitationUrl(citation.url, citation.source),
         };
       });
     }
@@ -2223,6 +2243,14 @@ const Triage = () => {
                                                 <Link to={item.to}>
                                                   {item.title}
                                                 </Link>
+                                              ) : item.href ? (
+                                                <a
+                                                  href={item.href}
+                                                  target="_blank"
+                                                  rel="noopener noreferrer"
+                                                >
+                                                  {item.title}
+                                                </a>
                                               ) : (
                                                 <span>{item.title}</span>
                                               )}
