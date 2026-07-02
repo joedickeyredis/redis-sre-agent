@@ -1,11 +1,13 @@
 """Unit tests for MCP tool provider."""
 
+import json
 import os
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from mcp import types as mcp_types
 
 from redis_sre_agent.core.config import MCPServerConfig, MCPToolConfig
 from redis_sre_agent.evaluation.fake_mcp import build_fixture_mcp_runtime
@@ -837,3 +839,94 @@ class TestMCPToolProviderAsync:
         # resolve_operation recovered the raw name that _get_tool_config keys on.
         assert call_args[0] == "searchAtlassian"
         assert call_kwargs["arguments"] == {"query": "redis", "cloudId": "cloud-123"}
+
+    def test_try_parse_json_object_returns_dict_for_object(self):
+        """A JSON object string parses to the corresponding dict (whitespace-tolerant)."""
+        assert MCPToolProvider._try_parse_json_object('{"a": 1}') == {"a": 1}
+        assert MCPToolProvider._try_parse_json_object('  {"a": 1}\n') == {"a": 1}
+
+    def test_try_parse_json_object_returns_none_for_non_object(self):
+        """Arrays, scalars, malformed, and non-JSON text all return None (never hoisted)."""
+        assert MCPToolProvider._try_parse_json_object("[1, 2, 3]") is None
+        assert MCPToolProvider._try_parse_json_object('"just a string"') is None
+        assert MCPToolProvider._try_parse_json_object("42") is None
+        assert MCPToolProvider._try_parse_json_object("plain text") is None
+        assert MCPToolProvider._try_parse_json_object("") is None
+        assert MCPToolProvider._try_parse_json_object("   ") is None
+        assert MCPToolProvider._try_parse_json_object('{"a": 1') is None
+
+    @staticmethod
+    def _make_session(*, structured_content, text):
+        """Build a mock MCP session returning one text block and optional structuredContent."""
+        session = MagicMock()
+        session.call_tool = AsyncMock(
+            return_value=SimpleNamespace(
+                isError=False,
+                structuredContent=structured_content,
+                content=[mcp_types.TextContent(type="text", text=text)],
+            )
+        )
+        return session
+
+    @pytest.mark.asyncio
+    async def test_call_mcp_tool_hoists_json_text_payload(self):
+        """A stringified JSON object with no structuredContent is merged onto the response."""
+        config = MCPServerConfig(command="test")
+        provider = MCPToolProvider(server_name="atlassian", server_config=config)
+        payload = {"results": [{"title": "T", "url": "u"}], "total": 1}
+        provider._session = self._make_session(
+            structured_content=None, text=json.dumps(payload)
+        )
+
+        result = await provider._call_mcp_tool("searchConfluenceUsingCql", {})
+
+        assert result["status"] == "success"
+        assert result["results"] == payload["results"]
+        assert result["total"] == 1
+        # Raw text is preserved alongside the hoisted keys.
+        assert result["text"] == json.dumps(payload)
+
+    @pytest.mark.asyncio
+    async def test_call_mcp_tool_skips_hoist_when_structured_content_present(self):
+        """JSON merging does not run when the server already provided structuredContent."""
+        config = MCPServerConfig(command="test")
+        provider = MCPToolProvider(server_name="atlassian", server_config=config)
+        payload = {"results": [{"title": "T"}]}
+        provider._session = self._make_session(
+            structured_content={"ok": True}, text=json.dumps(payload)
+        )
+
+        result = await provider._call_mcp_tool("searchConfluenceUsingCql", {})
+
+        assert result["data"] == {"ok": True}
+        assert "results" not in result
+        assert result["text"] == json.dumps(payload)
+
+    @pytest.mark.asyncio
+    async def test_call_mcp_tool_hoist_does_not_overwrite_reserved_keys(self):
+        """Hoisting never clobbers provider-owned keys (status/text/...)."""
+        config = MCPServerConfig(command="test")
+        provider = MCPToolProvider(server_name="atlassian", server_config=config)
+        payload = {"status": "hacked", "text": "hacked", "results": [1]}
+        provider._session = self._make_session(
+            structured_content=None, text=json.dumps(payload)
+        )
+
+        result = await provider._call_mcp_tool("searchConfluenceUsingCql", {})
+
+        assert result["status"] == "success"
+        assert result["text"] == json.dumps(payload)
+        assert result["results"] == [1]
+
+    @pytest.mark.asyncio
+    async def test_call_mcp_tool_leaves_non_json_text_untouched(self):
+        """Plain-text responses are left as-is (no hoisting, text preserved)."""
+        config = MCPServerConfig(command="test")
+        provider = MCPToolProvider(server_name="atlassian", server_config=config)
+        provider._session = self._make_session(
+            structured_content=None, text="just some prose"
+        )
+
+        result = await provider._call_mcp_tool("searchConfluenceUsingCql", {})
+
+        assert result == {"status": "success", "text": "just some prose"}

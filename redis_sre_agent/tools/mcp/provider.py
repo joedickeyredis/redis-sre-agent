@@ -5,6 +5,7 @@ and exposes its tools to the agent. It supports tool filtering and description
 overrides based on the MCPServerConfig.
 """
 
+import json
 import logging
 import os
 import re
@@ -37,6 +38,13 @@ logger = logging.getLogger(__name__)
 # Matches an unresolved ${VAR} placeholder left behind when os.path.expandvars
 # cannot resolve an environment variable (i.e. it is unset).
 _UNRESOLVED_VAR_RE = re.compile(r"\$\{[^}]*\}")
+
+# Fields that the tool-response envelope owns and populates directly (see
+# _call_mcp_tool). When a server returns its payload as a JSON object in a text
+# block, we merge that object's top-level keys into the response; keys colliding
+# with these owned fields are skipped so a remote server can never overwrite the
+# envelope's own status/data/text/error/etc.
+_RESERVED_RESPONSE_KEYS = frozenset({"status", "text", "error", "images", "resources", "data"})
 
 
 def _coerce_input_schema_dict(input_schema: Any) -> Optional[Dict[str, Any]]:
@@ -557,6 +565,23 @@ class MCPToolProvider(ToolProvider):
             merged[key] = resolved
         return merged
 
+    @staticmethod
+    def _try_parse_json_object(text: str) -> Optional[Dict[str, Any]]:
+        """Parse ``text`` as a JSON object, returning the dict or ``None``.
+
+        Only JSON *objects* (dicts) are returned. JSON arrays/scalars and non-JSON
+        text return ``None`` so they remain available via the raw ``text`` field and
+        are never hoisted onto the response.
+        """
+        stripped = text.strip()
+        if not stripped or stripped[0] != "{":
+            return None
+        try:
+            parsed = json.loads(stripped)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
     async def _call_mcp_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
         """Call an MCP tool on the server.
 
@@ -620,7 +645,23 @@ class MCPToolProvider(ToolProvider):
                         )
 
             if text_parts:
-                response["text"] = "\n".join(text_parts)
+                joined_text = "\n".join(text_parts)
+                response["text"] = joined_text
+
+                # Some MCP servers return their payload as a stringified JSON object in a
+                # text block and set no structuredContent, leaving the model (and our
+                # downstream consumers) an opaque blob. When that happens, parse the text
+                # and merge its top-level keys onto the response so consumers see real
+                # structure instead of a string: citation extraction reads
+                # response["results"] and evidence expansion runs JMESPath over the
+                # response. Only JSON objects are merged; envelope-owned keys are never
+                # overwritten and the full raw payload always remains in response["text"].
+                if not result.structuredContent:
+                    parsed = self._try_parse_json_object(joined_text)
+                    if parsed is not None:
+                        for key, value in parsed.items():
+                            if key not in _RESERVED_RESPONSE_KEYS:
+                                response.setdefault(key, value)
 
             return response
 
