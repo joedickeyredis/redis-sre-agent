@@ -1,6 +1,7 @@
 """Knowledge context builders for first-turn system prompt injection."""
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from redis_sre_agent.core.config import settings
@@ -137,6 +138,79 @@ def _extract_tool_categories(available_tools: Optional[List[Any]] = None) -> Lis
     return [category for category in ordered if category in categories]
 
 
+def _tool_names_for_category(
+    available_tools: Optional[List[Any]],
+    category: str,
+) -> List[str]:
+    """Return the names of available tools whose capability matches ``category``.
+
+    Order is preserved and duplicates are dropped so the list can be surfaced
+    verbatim to the model.
+    """
+    if not available_tools:
+        return []
+
+    target = category.strip().lower()
+    names: List[str] = []
+    seen: set[str] = set()
+    for tool in available_tools:
+        capability = getattr(tool, "capability", None)
+        if capability is None:
+            definition = getattr(tool, "definition", None)
+            capability = getattr(definition, "capability", None)
+        if capability is None:
+            metadata = getattr(tool, "metadata", None)
+            capability = getattr(metadata, "capability", None)
+        if capability is None:
+            continue
+
+        normalized = str(getattr(capability, "value", capability)).strip().lower()
+        if normalized != target:
+            continue
+
+        name = getattr(tool, "name", None)
+        if name is None:
+            definition = getattr(tool, "definition", None)
+            name = getattr(definition, "name", None)
+        if name is None:
+            metadata = getattr(tool, "metadata", None)
+            name = getattr(metadata, "name", None)
+        if not name:
+            continue
+
+        name = str(name)
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+# Tool names follow ``{provider_name}_{instance_hash}_{operation}`` where
+# instance_hash is a 6-char hex token (see redis_sre_agent/tools/protocols.py).
+# This anchors on the LAST such token so the captured prefix is the full
+# per-provider identity even when provider_name contains underscores.
+_SOURCE_PREFIX_RE = re.compile(r"^(.+_[0-9a-f]{6})_")
+
+
+def _knowledge_source_groups(
+    available_tools: Optional[List[Any]] = None,
+) -> "Dict[str, List[str]]":
+    """Group knowledge tool names by their provider prefix (one group per source).
+
+    Grouping is purely by the ``{provider_name}_{instance_hash}`` prefix; we do
+    not filter or key off the operation suffix because operation names differ
+    across providers. The greedy prefix regex anchors on the 6-hex instance hash
+    immediately before the operation; a future operation containing its own
+    ``_<6-hex>_`` segment could mis-split, but none of today's operations do.
+    """
+    groups: "Dict[str, List[str]]" = {}
+    for name in _tool_names_for_category(available_tools, "knowledge"):
+        match = _SOURCE_PREFIX_RE.match(name)
+        prefix = match.group(1) if match else name
+        groups.setdefault(prefix, []).append(name)
+    return groups
+
+
 def _tool_instruction_lines_for_categories(
     available_tools: Optional[List[Any]] = None,
 ) -> List[str]:
@@ -155,16 +229,32 @@ def _tool_instruction_lines_for_categories(
         "diagnostics": "- Use diagnostics tools for instance-level health checks and Redis command inspection.",
         "metrics": "- Use metrics tools for time-series signals and trend validation.",
         "logs": "- Use logs tools for event timelines and error correlation.",
-        "knowledge": "- Use knowledge tools for runbooks, skills, and documentation retrieval.",
+        "knowledge": (
+            "- Use knowledge tools for runbooks, skills, and documentation retrieval."
+        ),
         "tickets": "- Use tickets tools for historical incidents and prior remediation patterns. General knowledge search does not include support tickets.",
         "repos": "- Use repos tools for code and configuration investigation.",
         "traces": "- Use traces tools for distributed request-path analysis.",
         "utilities": "- Use utilities tools for safe helper operations (time conversion, lightweight formatting, etc.).",
     }
+    knowledge_source_groups = _knowledge_source_groups(available_tools)
     for category in categories:
         guidance_line = category_guidance.get(category)
         if guidance_line:
             lines.append(guidance_line)
+        if category == "knowledge" and len(knowledge_source_groups) > 1:
+            grouped = "; ".join(
+                f"{prefix}: {', '.join(names)}"
+                for prefix, names in knowledge_source_groups.items()
+            )
+            lines.append(
+                f"- Knowledge tools in this session come from {len(knowledge_source_groups)} "
+                f"distinct sources (grouped by provider). {grouped}. Different sources hold "
+                "different content, so for any runbook, documentation, or conceptual question, "
+                "do not stop after one source returns usable hits - query at least one "
+                "knowledge tool from a different source in the same turn, then synthesize a "
+                "single grounded answer that reconciles them and cite each source."
+            )
 
     if "tickets" in categories:
         lines.append(

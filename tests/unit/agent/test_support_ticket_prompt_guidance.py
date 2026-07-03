@@ -33,6 +33,67 @@ def test_startup_context_includes_support_ticket_tool_instructions():
     assert "get_support_ticket" not in joined
 
 
+def _knowledge_tool(name: str) -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        description="Knowledge lookup",
+        capability=ToolCapability.KNOWLEDGE,
+        parameters={"type": "object", "properties": {}, "required": []},
+    )
+
+
+def test_knowledge_guidance_lists_sources_when_multiple_providers():
+    lines = _tool_instruction_lines_for_categories(
+        [
+            _knowledge_tool("knowledge_12d8f6_search"),
+            _knowledge_tool("mcp_atlassian_rovo_mcp_12e3dc_searchAtlassian"),
+        ]
+    )
+    joined = "\n".join(lines)
+    assert "2 distinct sources" in joined
+    assert "query at least one knowledge tool from a different source" in joined
+    # Grouped under their provider prefixes, not a flat list.
+    assert "knowledge_12d8f6: knowledge_12d8f6_search" in joined
+    assert (
+        "mcp_atlassian_rovo_mcp_12e3dc: mcp_atlassian_rovo_mcp_12e3dc_searchAtlassian"
+        in joined
+    )
+
+
+def test_knowledge_guidance_omitted_for_single_source_multiple_ops():
+    # A single provider registering several knowledge ops must NOT trip the
+    # multi-source nudge (they share one provider prefix / one source).
+    lines = _tool_instruction_lines_for_categories(
+        [
+            _knowledge_tool("knowledge_12d8f6_search"),
+            _knowledge_tool("knowledge_12d8f6_ingest"),
+            _knowledge_tool("knowledge_12d8f6_get_skill"),
+        ]
+    )
+    joined = "\n".join(lines)
+    assert "distinct sources" not in joined
+    assert "different source" not in joined
+
+
+def test_knowledge_guidance_groups_mixed_ops_without_op_filtering():
+    # Mixed ops in one provider stay in one group; a second provider makes it
+    # multi-source. Ops like ingest/get_skill are grouped, not filtered out.
+    lines = _tool_instruction_lines_for_categories(
+        [
+            _knowledge_tool("knowledge_12d8f6_search"),
+            _knowledge_tool("knowledge_12d8f6_ingest"),
+            _knowledge_tool("knowledge_12d8f6_get_skill"),
+            _knowledge_tool("mcp_atlassian_rovo_mcp_12e3dc_searchConfluenceUsingCql"),
+        ]
+    )
+    joined = "\n".join(lines)
+    assert "2 distinct sources" in joined
+    assert (
+        "knowledge_12d8f6: knowledge_12d8f6_search, knowledge_12d8f6_ingest, "
+        "knowledge_12d8f6_get_skill" in joined
+    )
+
+
 def test_startup_context_omits_ticket_workflow_when_tickets_category_unavailable():
     lines = _tool_instruction_lines_for_categories(
         [
