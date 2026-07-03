@@ -97,6 +97,10 @@ mcp_servers:
       searchConfluenceUsingCql:
         capability: knowledge
         action_kind: read
+        # Soft nudge (not a hard cap): {original} keeps the upstream description and
+        # leaves `limit` in the schema so the model still chooses a count; we only
+        # steer it toward a practical page size for the search-then-fetch pattern.
+        description: "{original} Prefer a small limit (about 10, at most 25) since this is search-then-fetch: use the results to locate candidate pages, then read full content with getConfluencePage."
         arg_defaults:
           cloudId: ${ATLASSIAN_CLOUD_ID}
       getConfluencePage:
