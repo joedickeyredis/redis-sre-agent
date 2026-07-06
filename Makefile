@@ -13,7 +13,7 @@ UI_DIST ?= $(UI_DIR)/dist
 REDIS_DOCS_REPO_URL ?= https://github.com/redis/docs.git
 REDIS_DOCS_BRANCH ?= main
 
-.PHONY: help venv sync hooks-install lint docs-build docs-serve local-services local-services-down local-services-logs quick-demo test test-eval-pr test-eval-pr-live test-eval-live test-integration test-all ui-kit-install ui-kit-build ui-kit-dev ui-install ui-dev ui-build redis-docs-sync redis-docs-index
+.PHONY: help venv sync hooks-install lint docs-build docs-serve local-services local-services-down local-services-logs quick-demo test test-eval-pr test-eval-pr-live test-eval-live eval-knowledge-sources test-integration test-all ui-kit-install ui-kit-build ui-kit-dev ui-install ui-dev ui-build redis-docs-sync redis-docs-index
 
 help: ## Show this help and available targets
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage: make <target>\n\nTargets:\n"} /^[a-zA-Z0-9][^:]*:.*##/ { printf "  %-20s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -153,6 +153,14 @@ test-eval-pr-live: sync ## Run the LLM-backed eval suite used in PR CI
 		--trigger $(EVAL_PR_LIVE_TRIGGER) \
 		--session-id-prefix pr-live-eval \
 		$(if $(filter true,$(EVAL_PR_LIVE_REDIS_TESTCONTAINER)),--redis-testcontainer,)
+
+KSE_MIN_BOTH_SOURCE_RATE ?= 0.8
+KSE_OUTPUT ?= artifacts/knowledge-source-eval/scorecard.json
+
+eval-knowledge-sources: sync ## Score multi knowledge-source coverage over source-neutral queries (live)
+	$(UV) run python scripts/knowledge_source_eval.py \
+		--min-both-source-rate $(KSE_MIN_BOTH_SOURCE_RATE) \
+		--output $(KSE_OUTPUT)
 
 test-integration: sync ## Run integration tests only
 	$(UV) run pytest -m integration
