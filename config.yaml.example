@@ -93,7 +93,7 @@ mcp_servers:
       searchAtlassian:
         capability: knowledge
         action_kind: read
-        description: "Search the Redis SRE team's internal Confluence knowledge base (runbooks, incident write-ups, and internal documentation). Consult this alongside the built-in general knowledge base for any documentation, runbook, or troubleshooting question - it holds different content. {original}"
+        description: "Search the Redis SRE team's internal Confluence knowledge base (runbooks, incident write-ups, and internal documentation). Consult this alongside the built-in general knowledge base for any documentation, runbook, or troubleshooting question - it holds different content. Use plain natural-language queries; do NOT use search operators (e.g. issue:, type:, site:, AND/OR, field filters) - they are ignored by this tool. {original}"
         arg_defaults:
           cloudId: ${ATLASSIAN_CLOUD_ID}
         # searchAtlassian has no server-side type/limit control and spans all Atlassian
