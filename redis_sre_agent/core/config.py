@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Typ
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import (
     BaseSettings,
     InitSettingsSource,
@@ -21,6 +21,75 @@ from redis_sre_agent.tools.models import ToolActionKind, ToolCapability
 
 if TYPE_CHECKING:
     pass
+
+
+# Fields the tool-response envelope owns and populates directly (see
+# MCPToolProvider._call_mcp_tool). When a server returns its payload as a JSON object
+# in a text block, the provider merges that object's top-level keys onto the response;
+# keys colliding with these owned fields are skipped so a remote server can never
+# overwrite the envelope's own status/data/text/error/etc. A shaping ``results_path``
+# pointing at one of these keys would be shaped but then dropped by that merge guard, so
+# it is rejected at config load (see MCPResultShaping.validate_results_path).
+RESERVED_RESPONSE_KEYS = frozenset({"status", "text", "error", "images", "resources", "data"})
+
+
+class MCPResultShaping(BaseModel):
+    """Client-side shaping for the result list an MCP tool returns.
+
+    Some MCP servers expose no server-side control over how many results come back,
+    how they are ranked, or which kinds are included, so a single search can return a
+    large, mixed, low-signal set. This applies a generic, vendor-neutral trim/filter in
+    the provider normalizer BEFORE results reach the LLM context or citation extraction.
+
+    All fields are optional; only a tool that opts in (by declaring ``result_shaping``)
+    is ever shaped. The two levers are:
+
+    - ``include_types``: keep only results whose ``type_field`` value is in this list
+      (scope filter). Leave unset to keep every kind.
+    - ``max_results``: hard cap on how many shaped results are kept (a cap, not a quota).
+
+    Order is: original list -> filter by ``include_types`` -> keep first ``max_results``.
+    """
+
+    results_path: str = Field(
+        default="results",
+        description="Single top-level key on the tool payload holding the list of result "
+        "objects (not a dotted/nested path). If the key is absent or is not a list, shaping "
+        "is a safe no-op and the payload is left untouched.",
+    )
+    type_field: str = Field(
+        default="type",
+        description="Field on each result object whose value ``include_types`` matches against.",
+    )
+    include_types: Optional[List[str]] = Field(
+        default=None,
+        description="If set, keep only results whose ``type_field`` value is in this list. "
+        "Unset keeps all kinds.",
+    )
+    max_results: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="If set, hard cap on the number of shaped results kept (a cap, not a quota).",
+    )
+
+    @field_validator("results_path")
+    @classmethod
+    def validate_results_path(cls, value: str) -> str:
+        """Reject a ``results_path`` that collides with an envelope-owned key.
+
+        On the text-payload path the provider hoists the shaped payload's top-level keys
+        onto the response but skips any key in ``RESERVED_RESPONSE_KEYS``. A shaping
+        ``results_path`` pointing at one of those keys would therefore be trimmed and then
+        silently dropped, surfacing no results (a citation miss). Fail fast at load time
+        with a clear message instead of degrading quietly at runtime.
+        """
+        if value in RESERVED_RESPONSE_KEYS:
+            raise ValueError(
+                f"result_shaping.results_path={value!r} collides with a reserved response "
+                f"envelope key ({', '.join(sorted(RESERVED_RESPONSE_KEYS))}); choose the "
+                "tool's own results key (e.g. 'results')."
+            )
+        return value
 
 
 class MCPToolConfig(BaseModel):
@@ -65,6 +134,12 @@ class MCPToolConfig(BaseModel):
             "skipped: the key stays in the schema and the model-supplied value is used as "
             "the fallback."
         ),
+    )
+    result_shaping: Optional[MCPResultShaping] = Field(
+        default=None,
+        description="Optional client-side trim/filter applied to this tool's result list "
+        "before results reach the LLM or citations. Use for search tools whose server "
+        "exposes no limit/type/score control. See MCPResultShaping.",
     )
 
 

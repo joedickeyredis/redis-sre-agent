@@ -18,7 +18,12 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
-from redis_sre_agent.core.config import MCPServerConfig, MCPToolConfig
+from redis_sre_agent.core.config import (
+    RESERVED_RESPONSE_KEYS,
+    MCPResultShaping,
+    MCPServerConfig,
+    MCPToolConfig,
+)
 from redis_sre_agent.core.runtime_overrides import get_active_mcp_runtime
 from redis_sre_agent.tools.models import (
     Tool,
@@ -38,14 +43,6 @@ logger = logging.getLogger(__name__)
 # Matches an unresolved ${VAR} placeholder left behind when os.path.expandvars
 # cannot resolve an environment variable (i.e. it is unset).
 _UNRESOLVED_VAR_RE = re.compile(r"\$\{[^}]*\}")
-
-# Fields that the tool-response envelope owns and populates directly (see
-# _call_mcp_tool). When a server returns its payload as a JSON object in a text
-# block, we merge that object's top-level keys into the response; keys colliding
-# with these owned fields are skipped so a remote server can never overwrite the
-# envelope's own status/data/text/error/etc.
-_RESERVED_RESPONSE_KEYS = frozenset({"status", "text", "error", "images", "resources", "data"})
-
 
 def _coerce_input_schema_dict(input_schema: Any) -> Optional[Dict[str, Any]]:
     """Normalize MCP input schemas into plain JSON-serializable dicts."""
@@ -566,6 +563,44 @@ class MCPToolProvider(ToolProvider):
         return merged
 
     @staticmethod
+    def _apply_result_shaping(container: Dict[str, Any], shaping: MCPResultShaping) -> bool:
+        """Trim/filter a tool's result list in-place; return True if it changed.
+
+        Vendor-neutral: some MCP servers expose no server-side control over how many
+        results come back or which kinds are included, so a single search returns a
+        large, mixed, low-signal set. This optionally keeps only results whose
+        ``type_field`` value is in ``include_types``, then limits the final number of
+        results to ``max_results``. What qualifies as in-scope (the allowed type values
+        and the result limit) is controlled entirely by configuration, so no provider-
+        or product-specific logic is embedded here. Only tools that explicitly enable
+        ``result_shaping`` in their configuration have these filters applied.
+
+        Runs before the response is serialized for the LLM and before citation
+        extraction, so the shaped set is the only one either ever sees.
+        """
+        results = container.get(shaping.results_path)
+        if not isinstance(results, list) or not results:
+            return False
+
+        limit = shaping.max_results
+        include = shaping.include_types
+
+        shaped: List[Any] = []
+        for item in results:
+            if include is not None and (
+                not isinstance(item, dict) or item.get(shaping.type_field) not in include
+            ):
+                continue
+            shaped.append(item)
+            if limit is not None and len(shaped) >= limit:
+                break
+
+        if shaped == results:
+            return False
+        container[shaping.results_path] = shaped
+        return True
+
+    @staticmethod
     def _try_parse_json_object(text: str) -> Optional[Dict[str, Any]]:
         """Parse ``text`` as a JSON object, returning the dict or ``None``.
 
@@ -618,6 +653,12 @@ class MCPToolProvider(ToolProvider):
             # Extract the result content
             response: Dict[str, Any] = {"status": "success"}
 
+            # Optional client-side trim/filter for tools that opt in via config (e.g.
+            # search tools whose server exposes no limit/type/score lever). See
+            # MCPResultShaping / _apply_result_shaping. None for unconfigured tools.
+            tool_config = self._get_tool_config(tool_name)
+            result_shaping = tool_config.result_shaping if tool_config else None
+
             # If there's structured content, use it
             if result.structuredContent:
                 response["data"] = result.structuredContent
@@ -659,8 +700,14 @@ class MCPToolProvider(ToolProvider):
                 if not result.structuredContent:
                     parsed = self._try_parse_json_object(joined_text)
                     if parsed is not None:
+                        # Apply configured result shaping before hoisting. When it changes
+                        # the payload, rewrite the raw text blob too so the LLM-facing
+                        # payload and the hoisted keys reflect the same shaped set (the
+                        # trimmed-out results are deliberately dropped, not preserved).
+                        if result_shaping and self._apply_result_shaping(parsed, result_shaping):
+                            response["text"] = json.dumps(parsed)
                         for key, value in parsed.items():
-                            if key not in _RESERVED_RESPONSE_KEYS:
+                            if key not in RESERVED_RESPONSE_KEYS:
                                 response.setdefault(key, value)
 
             return response

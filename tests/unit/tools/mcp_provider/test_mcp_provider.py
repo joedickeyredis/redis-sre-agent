@@ -8,8 +8,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from mcp import types as mcp_types
+from pydantic import ValidationError
 
-from redis_sre_agent.core.config import MCPServerConfig, MCPToolConfig
+from redis_sre_agent.core.config import MCPResultShaping, MCPServerConfig, MCPToolConfig
 from redis_sre_agent.evaluation.fake_mcp import build_fixture_mcp_runtime
 from redis_sre_agent.evaluation.injection import eval_injection_scope
 from redis_sre_agent.evaluation.scenarios import EvalScenario
@@ -930,3 +931,263 @@ class TestMCPToolProviderAsync:
         result = await provider._call_mcp_tool("searchConfluenceUsingCql", {})
 
         assert result == {"status": "success", "text": "just some prose"}
+
+    @pytest.mark.asyncio
+    async def test_call_mcp_tool_applies_configured_result_shaping_end_to_end(self):
+        """A tool with result_shaping is filtered + trimmed in BOTH hoisted results and text."""
+        config = MCPServerConfig(
+            command="test",
+            tools={
+                "searchAtlassian": MCPToolConfig(
+                    result_shaping=MCPResultShaping(
+                        include_types=["page", "blogpost"],
+                        max_results=8,
+                    )
+                )
+            },
+        )
+        provider = MCPToolProvider(server_name="atlassian_rovo_mcp", server_config=config)
+        payload = {
+            "results": [_result("page", 1), _result("issue", 1), _result("page", 2)],
+            "total": 3,
+        }
+        provider._session = self._make_session(
+            structured_content=None, text=json.dumps(payload)
+        )
+
+        result = await provider._call_mcp_tool("searchAtlassian", {})
+
+        # Out-of-scope "issue" dropped from the hoisted, citation-facing results.
+        assert [r["type"] for r in result["results"]] == ["page", "page"]
+        # The raw text blob the LLM sees is rewritten to the same shaped set...
+        reserialized = json.loads(result["text"])
+        assert reserialized["results"] == result["results"]
+        # ...while non-results keys are preserved.
+        assert reserialized["total"] == 3
+
+    @pytest.mark.asyncio
+    async def test_call_mcp_tool_leaves_results_untouched_without_shaping_config(self):
+        """A tool with no result_shaping config keeps every result and the raw text."""
+        config = MCPServerConfig(command="test")
+        provider = MCPToolProvider(server_name="atlassian_rovo_mcp", server_config=config)
+        payload = {"results": [_result("page", 1), _result("issue", 1)]}
+        provider._session = self._make_session(
+            structured_content=None, text=json.dumps(payload)
+        )
+
+        result = await provider._call_mcp_tool("searchAtlassian", {})
+
+        assert result["results"] == payload["results"]
+        assert result["text"] == json.dumps(payload)
+
+    @pytest.mark.asyncio
+    async def test_call_mcp_tool_does_not_shape_structured_content(self):
+        """result_shaping is text-path only; structuredContent passes through untouched.
+
+        Shaping deliberately does not run on the structuredContent branch: results there
+        live nested under response['data'] (not hoisted to top level), so they are neither
+        cited nor consumed the way the text-path payload is, and trimming only 'data' while
+        leaving the full list in 'text' would present two inconsistent sets to the LLM.
+        """
+        config = MCPServerConfig(
+            command="test",
+            tools={
+                "searchAtlassian": MCPToolConfig(
+                    result_shaping=MCPResultShaping(include_types=["page"])
+                )
+            },
+        )
+        provider = MCPToolProvider(server_name="atlassian_rovo_mcp", server_config=config)
+        provider._session = self._make_session(
+            structured_content={"results": [_result("page", 1), _result("issue", 1)]},
+            text="{}",
+        )
+
+        result = await provider._call_mcp_tool("searchAtlassian", {})
+
+        assert [r["type"] for r in result["data"]["results"]] == ["page", "issue"]
+
+
+def _result(type_: str, index: int) -> dict:
+    return {"id": f"{type_}/{index}", "title": f"{type_} {index}", "type": type_}
+
+
+class TestMCPResultShaping:
+    """Unit tests for the generic, config-driven result shaping."""
+
+    def test_filters_by_include_types(self):
+        shaping = MCPResultShaping(include_types=["page", "blogpost"])
+        parsed = {"results": [_result("page", 1), _result("issue", 1), _result("blogpost", 1)]}
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        assert [r["type"] for r in parsed["results"]] == ["page", "blogpost"]
+
+    def test_filter_then_cap_compose(self):
+        # Cap counts POST-filter: filter to pages, then keep the first 2 of those.
+        shaping = MCPResultShaping(include_types=["page"], max_results=2)
+        parsed = {
+            "results": [
+                _result("page", 1),
+                _result("issue", 1),
+                _result("page", 2),
+                _result("page", 3),
+            ]
+        }
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        assert [r["title"] for r in parsed["results"]] == ["page 1", "page 2"]
+
+    def test_max_results_is_a_cap(self):
+        shaping = MCPResultShaping(max_results=2)
+        parsed = {"results": [_result("page", i) for i in range(5)]}
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        assert len(parsed["results"]) == 2
+
+    def test_all_filtered_out_yields_empty(self):
+        # Nothing in scope -> empty rather than a weak out-of-scope hit.
+        shaping = MCPResultShaping(include_types=["page"])
+        parsed = {"results": [_result("issue", 1), _result("issue", 2)]}
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        assert parsed["results"] == []
+
+    def test_custom_results_path_and_type_field(self):
+        # Generic: not tied to "results"/"type" key names.
+        shaping = MCPResultShaping(
+            results_path="items", type_field="kind", include_types=["doc"]
+        )
+        parsed = {"items": [{"kind": "doc"}, {"kind": "ticket"}, {"kind": "doc"}]}
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        assert parsed["items"] == [{"kind": "doc"}, {"kind": "doc"}]
+
+    def test_noop_when_nothing_changes(self):
+        # A config that removes nothing reports no change (so text is not rewritten).
+        shaping = MCPResultShaping(include_types=["page"])
+        parsed = {"results": [_result("page", 1), _result("page", 2)]}
+
+        assert MCPToolProvider._apply_result_shaping(parsed, shaping) is False
+        assert len(parsed["results"]) == 2
+
+    def test_missing_or_empty_results_are_noops(self):
+        shaping = MCPResultShaping(include_types=["page"])
+        assert MCPToolProvider._apply_result_shaping({}, shaping) is False
+        assert MCPToolProvider._apply_result_shaping({"results": []}, shaping) is False
+        assert MCPToolProvider._apply_result_shaping({"results": "nope"}, shaping) is False
+
+    def test_non_dict_item_dropped_only_when_filtering(self):
+        # With a type filter, a non-dict item can't match and is dropped.
+        shaping = MCPResultShaping(include_types=["page"])
+        parsed = {"results": ["not-a-dict", _result("page", 1)]}
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        assert parsed["results"] == [_result("page", 1)]
+
+    def test_non_dict_item_kept_when_not_filtering(self):
+        # Without include_types, items are not inspected, so non-dicts survive trimming.
+        shaping = MCPResultShaping(max_results=3)
+        parsed = {"results": ["a", {"whatever": 1}, 42, "d"]}
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        assert parsed["results"] == ["a", {"whatever": 1}, 42]
+
+    def test_generic_shape_unlike_atlassian(self):
+        # An Elasticsearch/OpenSearch-style shape with entirely different key names and
+        # unrelated item fields. Proves the trimmer is not coupled to Atlassian at all,
+        # and that filter -> cap compose on a foreign shape.
+        shaping = MCPResultShaping(
+            results_path="hits",
+            type_field="doctype",
+            include_types=["article"],
+            max_results=2,
+        )
+        parsed = {
+            "hits": [
+                {"doctype": "article", "score": 9.1, "body": "keep-1"},
+                {"doctype": "faq", "score": 8.0},
+                {"doctype": "article", "score": 7.2, "body": "keep-2"},
+                {"doctype": "article", "score": 6.0, "body": "capped-out"},
+            ],
+            "took_ms": 12,
+        }
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        # faq filtered; cap=2 -> first two articles.
+        assert [h["body"] for h in parsed["hits"]] == ["keep-1", "keep-2"]
+        # Unrelated top-level keys are untouched.
+        assert parsed["took_ms"] == 12
+
+    def test_missing_configured_path_is_safe_noop(self):
+        # If the configured results_path is absent (shape mismatch), do nothing rather
+        # than guess or drop data. This is the core safety property for unknown shapes.
+        shaping = MCPResultShaping(results_path="hits", include_types=["article"])
+        parsed = {"results": [_result("page", 1)], "other": "x"}
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is False
+        assert parsed == {"results": [_result("page", 1)], "other": "x"}
+
+    def test_nested_path_is_not_traversed_and_is_safe_noop(self):
+        # KNOWN LIMITATION: results_path is a single top-level key, not a dotted path.
+        # A nested result list is left untouched (safe) rather than silently mangled.
+        shaping = MCPResultShaping(results_path="results", include_types=["page"])
+        parsed = {"data": {"results": [_result("page", 1), _result("issue", 1)]}}
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is False
+        assert parsed["data"]["results"] == [_result("page", 1), _result("issue", 1)]
+
+    def test_items_missing_type_field_are_dropped_under_filter(self):
+        # A scope filter (include_types) intentionally drops items lacking the type field
+        # (item.get(type_field) is None, not in include_types). This keeps a Jira-like
+        # item that omits the field from slipping into a Confluence-only result set.
+        shaping = MCPResultShaping(include_types=["page"])
+        parsed = {"results": [{"title": "no type here"}, _result("page", 1)]}
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        assert parsed["results"] == [_result("page", 1)]
+
+    def test_trim_only_without_filter_keeps_all_kinds(self):
+        # include_types unset: pure cap, no scope filtering, so every kind is eligible.
+        shaping = MCPResultShaping(max_results=2)
+        parsed = {"results": [_result("page", 1), _result("issue", 1), _result("faq", 1)]}
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        assert [r["type"] for r in parsed["results"]] == ["page", "issue"]
+
+    @pytest.mark.parametrize(
+        "reserved", ["status", "text", "error", "images", "resources", "data"]
+    )
+    def test_results_path_colliding_with_reserved_key_is_rejected(self, reserved):
+        # A results_path pointing at an envelope-owned key would be shaped and then
+        # silently dropped by the text-path hoist guard. Fail fast at config load.
+        with pytest.raises(ValidationError):
+            MCPResultShaping(results_path=reserved)
+
+    def test_default_results_path_is_accepted(self):
+        # The default and ordinary domain keys pass validation unchanged.
+        assert MCPResultShaping().results_path == "results"
+        assert MCPResultShaping(results_path="items").results_path == "items"

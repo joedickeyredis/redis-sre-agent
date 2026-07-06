@@ -84,28 +84,45 @@ mcp_servers:
     # model never sees it and won't stall asking the user for it) and injected at call
     # time, so cloudId is set on every call.
     tools:
+      # Description overrides use {original} to keep the upstream schema/guidance and
+      # prepend topical identity: these tools are an additional Redis SRE knowledge
+      # source (internal Confluence), so the model treats them as peers of the built-in
+      # knowledge base for runbook/documentation questions instead of generic Atlassian
+      # search. Branding lives here (not in the system prompt) to keep the prompt
+      # provider-agnostic and extensible.
       searchAtlassian:
         capability: knowledge
         action_kind: read
+        description: "Search the Redis SRE team's internal Confluence knowledge base (runbooks, incident write-ups, and internal documentation). Consult this alongside the built-in general knowledge base for any documentation, runbook, or troubleshooting question - it holds different content. {original}"
         arg_defaults:
           cloudId: ${ATLASSIAN_CLOUD_ID}
+        # searchAtlassian has no server-side type/limit control and spans all Atlassian
+        # products, so a docs query returns many mixed, low-signal hits (Jira issues,
+        # CVEs). Keep only Confluence documents (type page/blogpost) and cap at 8 -
+        # applied before results reach the LLM context or citations. result_shaping is
+        # generic: any MCP search tool can use it.
+        result_shaping:
+          include_types: [page, blogpost]
+          max_results: 8
       fetchAtlassian:
         capability: knowledge
         action_kind: read
+        description: "{original} Use this to read complete internal Redis SRE documentation."
         arg_defaults:
           cloudId: ${ATLASSIAN_CLOUD_ID}
       searchConfluenceUsingCql:
         capability: knowledge
         action_kind: read
-        # Soft nudge (not a hard cap): {original} keeps the upstream description and
-        # leaves `limit` in the schema so the model still chooses a count; we only
-        # steer it toward a practical page size for the search-then-fetch pattern.
-        description: "{original} Prefer a small limit (about 10, at most 25) since this is search-then-fetch: use the results to locate candidate pages, then read full content with getConfluencePage."
+        # Topical identity + soft nudge (not a hard cap): {original} keeps the upstream
+        # description and leaves `limit` in the schema so the model still chooses a count;
+        # we only steer it toward a practical page size for the search-then-fetch pattern.
+        description: "Search the Redis SRE team's internal Confluence knowledge base (runbooks, incident write-ups, internal docs) using CQL. Consult this alongside the built-in general knowledge base for documentation and troubleshooting questions. Prefer a small limit (about 10, at most 25) since this is search-then-fetch: use the results to locate candidate pages, then read full content with getConfluencePage. {original}"
         arg_defaults:
           cloudId: ${ATLASSIAN_CLOUD_ID}
       getConfluencePage:
         capability: knowledge
         action_kind: read
+        description: "{original} Use this to read complete internal Redis SRE documentation."
         arg_defaults:
           cloudId: ${ATLASSIAN_CLOUD_ID}
 
