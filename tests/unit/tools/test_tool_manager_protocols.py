@@ -13,9 +13,14 @@ async def test_protocol_selection_for_knowledge_search_only():
         tools = mgr.get_tools_for_capability(ToolCapability.KNOWLEDGE)
         assert tools, "Expected at least one knowledge tool"
 
-        # All should be knowledge provider tools, and there should be a search op
+        # The built-in KB provider tools use the knowledge_ prefix and expose a
+        # search op. MCP tools (e.g. Atlassian Confluence) may also carry the
+        # KNOWLEDGE capability but use a different naming convention
+        # (mcp_servername_hash_toolname), so skip them here.
         has_search = False
         for t in tools:
+            if t.name.startswith("mcp_"):
+                continue
             assert t.name.startswith("knowledge_"), f"Unexpected provider prefix: {t.name}"
             parts = t.name.split("_", 2)
             op = parts[2] if len(parts) >= 3 else parts[-1]
