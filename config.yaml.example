@@ -100,7 +100,9 @@ mcp_servers:
         # products, so a docs query returns many mixed, low-signal hits (Jira issues,
         # CVEs). Keep only Confluence documents (type page/blogpost) and cap at 8 -
         # applied before results reach the LLM context or citations. result_shaping is
-        # generic: any MCP search tool can use it.
+        # generic: any MCP search tool can use it. (No drop_fields here: Rovo's generic
+        # search already returns a clean per-result shape - id/title/text/url/type/metadata
+        # - so there is no verbose metadata to prune; that bloat is CQL-only.)
         result_shaping:
           include_types: [page, blogpost]
           max_results: 8
@@ -119,6 +121,16 @@ mcp_servers:
         description: "Search the Redis SRE team's internal Confluence knowledge base (runbooks, incident write-ups, internal docs) using CQL. Consult this alongside the built-in general knowledge base for documentation and troubleshooting questions. Prefer a small limit (about 10, at most 25) since this is search-then-fetch: use the results to locate candidate pages, then read full content with getConfluencePage. {original}"
         arg_defaults:
           cloudId: ${ATLASSIAN_CLOUD_ID}
+        # CQL is the raw Confluence REST passthrough, so each result carries verbose
+        # metadata (author profiles, HATEOAS links, expand hints); drop_fields prunes it by
+        # key NAME at any depth (removing a key drops its whole subtree). No max_results
+        # here: unlike searchAtlassian, CQL exposes a `limit` param the model controls
+        # (nudged to ~10, at most 25 in the description above), so count is the model's
+        # lever and drop_fields only strips the per-result bloat it cannot control. No
+        # include_types either - CQL nests the kind at content.type, so a top-level
+        # type_field filter would match nothing; CQL already scopes type via the query.
+        result_shaping:
+          drop_fields: [history, _expandable, _links, macroRenderedOutput, extensions, base64EncodedAri, profilePicture, iconCssClass, breadcrumbs]
       getConfluencePage:
         capability: knowledge
         action_kind: read

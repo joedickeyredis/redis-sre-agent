@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+from collections import Counter
 from contextlib import AsyncExitStack
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -563,28 +564,68 @@ class MCPToolProvider(ToolProvider):
         return merged
 
     @staticmethod
-    def _apply_result_shaping(container: Dict[str, Any], shaping: MCPResultShaping) -> bool:
-        """Trim/filter a tool's result list in-place; return True if it changed.
+    def _prune_in_place(obj: Any, drop_names: set) -> "Counter[str]":
+        """Recursively remove any dict key whose NAME is in ``drop_names``; return a
+        ``Counter`` of the names actually removed (empty when nothing changed).
+
+        Matches by exact key name at any depth (path-agnostic), not by dotted path.
+        Removing a key drops its entire subtree and counts as ONE removal for that name, so
+        the tally reflects dropped keys, not every descendant that vanished with them (e.g.
+        dropping ``history`` removes the whole author-profile subtree but counts once).
+        Recurses into surviving dict values and list items; non-container values are left
+        as-is. Matched keys short-circuit descent (the dropped subtree is not traversed).
+
+        Returning the actual names (not just a total) lets the caller log which fields were
+        stripped, rather than echoing the configured denylist. The walk trusts
+        ``drop_names`` verbatim; the protected-name floor that keeps citation/identity
+        fields undroppable is enforced upstream at config load
+        (MCPResultShaping.reject_protected_drop_fields).
+        """
+        removed: "Counter[str]" = Counter()
+        if isinstance(obj, dict):
+            for key in list(obj.keys()):
+                if key in drop_names:
+                    del obj[key]
+                    removed[key] += 1
+                else:
+                    removed.update(MCPToolProvider._prune_in_place(obj[key], drop_names))
+        elif isinstance(obj, list):
+            for item in obj:
+                removed.update(MCPToolProvider._prune_in_place(item, drop_names))
+        return removed
+
+    @staticmethod
+    def _apply_result_shaping(
+        container: Dict[str, Any],
+        shaping: MCPResultShaping,
+        tool_name: str = "",
+    ) -> bool:
+        """Trim/filter/prune a tool's result list in-place; return True if it changed.
 
         Vendor-neutral: some MCP servers expose no server-side control over how many
-        results come back or which kinds are included, so a single search returns a
-        large, mixed, low-signal set. This optionally keeps only results whose
-        ``type_field`` value is in ``include_types``, then limits the final number of
-        results to ``max_results``. What qualifies as in-scope (the allowed type values
-        and the result limit) is controlled entirely by configuration, so no provider-
-        or product-specific logic is embedded here. Only tools that explicitly enable
-        ``result_shaping`` in their configuration have these filters applied.
+        results come back, which kinds are included, or how verbose each result is, so a
+        single search returns a large, mixed, low-signal set. This optionally (a) keeps only
+        results whose ``type_field`` value is in ``include_types``, (b) limits the final
+        number of results to ``max_results``, and (c) recursively prunes ``drop_fields`` key
+        names from each kept result. What qualifies as in-scope (the allowed type values, the
+        result limit, the pruned field names) is controlled entirely by configuration, so no
+        provider- or product-specific logic is embedded here. Only tools that explicitly
+        enable ``result_shaping`` in their configuration are shaped.
 
         Runs before the response is serialized for the LLM and before citation
         extraction, so the shaped set is the only one either ever sees.
         """
+        # Phase 0 - locate: shaping is a no-op unless results_path holds a non-empty list.
         results = container.get(shaping.results_path)
         if not isinstance(results, list) or not results:
             return False
 
+        original_count = len(results)
         limit = shaping.max_results
         include = shaping.include_types
 
+        # Phase 1 + 2 - filter by include_types, then cap at max_results (single pass:
+        # only kept items count toward the cap).
         shaped: List[Any] = []
         for item in results:
             if include is not None and (
@@ -595,8 +636,37 @@ class MCPToolProvider(ToolProvider):
             if limit is not None and len(shaped) >= limit:
                 break
 
-        if shaped == results:
+        # Compute filter/cap change BEFORE pruning: prune mutates items in place, and
+        # ``shaped`` holds the same dict references as ``results`` for kept items, so a
+        # post-prune equality check would miss a prune-only change.
+        list_changed = shaped != results
+
+        # Phase 3 - prune: recursively strip drop_fields from each kept result, tallying
+        # the names actually removed (not just the configured denylist).
+        pruned: "Counter[str]" = Counter()
+        if shaping.drop_fields:
+            drop_names = set(shaping.drop_fields)
+            for item in shaped:
+                pruned.update(MCPToolProvider._prune_in_place(item, drop_names))
+
+        # Phase 4 - commit: bail if nothing changed, else log and write the shaped list back.
+        if not list_changed and not pruned:
             return False
+
+        # Pruning and capping are silent and lossy (dropped data never reaches the LLM,
+        # citations, or the trace), so record what shaping removed to make "why is this
+        # field/result missing?" answerable without reconstructing it. INFO, not DEBUG:
+        # this fires only on tools that opt into shaping AND only when something was
+        # actually removed, so it is meaningful signal, not per-request noise.
+        logger.info(
+            "result_shaping on '%s' (%s): kept %d/%d result(s), pruned %d field(s)%s",
+            tool_name or "<unknown tool>",
+            shaping.results_path,
+            len(shaped),
+            original_count,
+            sum(pruned.values()),
+            f" {dict(sorted(pruned.items()))}" if pruned else "",
+        )
         container[shaping.results_path] = shaped
         return True
 
@@ -704,11 +774,24 @@ class MCPToolProvider(ToolProvider):
                         # the payload, rewrite the raw text blob too so the LLM-facing
                         # payload and the hoisted keys reflect the same shaped set (the
                         # trimmed-out results are deliberately dropped, not preserved).
-                        if result_shaping and self._apply_result_shaping(parsed, result_shaping):
+                        if result_shaping and self._apply_result_shaping(
+                            parsed, result_shaping, tool_name
+                        ):
                             response["text"] = json.dumps(parsed)
                         for key, value in parsed.items():
                             if key not in RESERVED_RESPONSE_KEYS:
                                 response.setdefault(key, value)
+
+                        # The hoisted top-level keys now fully duplicate the raw text blob,
+                        # so text is redundant and needlessly doubles the payload in the
+                        # envelope (citations, expand_evidence, decision trace). Drop it -
+                        # but only when no top-level key collided with a reserved envelope
+                        # key: a colliding key (e.g. a payload-level "data") is skipped by
+                        # the hoist above and survives ONLY in text, so keep text in that
+                        # case. Non-hoisting tools (non-JSON text, single-page bodies) never
+                        # reach this branch, so their text is left untouched.
+                        if not (set(parsed) & RESERVED_RESPONSE_KEYS):
+                            response.pop("text", None)
 
             return response
 

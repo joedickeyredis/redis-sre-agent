@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Typ
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     InitSettingsSource,
@@ -32,6 +32,14 @@ if TYPE_CHECKING:
 # it is rejected at config load (see MCPResultShaping.validate_results_path).
 RESERVED_RESPONSE_KEYS = frozenset({"status", "text", "error", "images", "resources", "data"})
 
+# Key names ``drop_fields`` may never remove, enforced at config load by
+# MCPResultShaping.reject_protected_drop_fields. Scoped to structural invariants only: the
+# envelope-owned RESERVED_RESPONSE_KEYS, plus (added per-instance in the validator) the
+# tool's own ``results_path``/``type_field``. Consumer-convention fields like ``url`` are
+# intentionally NOT protected - that would bake vendor field names into a vendor-neutral
+# lever; the INFO log in _apply_result_shaping is the safety net for a mistaken drop.
+PROTECTED_PRUNE_KEYS = RESERVED_RESPONSE_KEYS
+
 
 class MCPResultShaping(BaseModel):
     """Client-side shaping for the result list an MCP tool returns.
@@ -42,13 +50,20 @@ class MCPResultShaping(BaseModel):
     the provider normalizer BEFORE results reach the LLM context or citation extraction.
 
     All fields are optional; only a tool that opts in (by declaring ``result_shaping``)
-    is ever shaped. The two levers are:
+    is ever shaped. The three levers are:
 
     - ``include_types``: keep only results whose ``type_field`` value is in this list
       (scope filter). Leave unset to keep every kind.
     - ``max_results``: hard cap on how many shaped results are kept (a cap, not a quota).
+    - ``drop_fields``: recursively remove these key NAMES from each kept result (at any
+      depth). This is a LOSSY field prune for verbose per-result metadata; because the
+      names are enumerated, opting in is intentional and cannot be an accidental side
+      effect of enabling ``include_types``/``max_results``. A protected floor
+      (``PROTECTED_PRUNE_KEYS`` plus this tool's ``results_path``/``type_field``) is
+      rejected at load, so the prune can never strip citation/identity fields.
 
-    Order is: original list -> filter by ``include_types`` -> keep first ``max_results``.
+    Order is: original list -> filter by ``include_types`` -> keep first ``max_results``
+    -> prune ``drop_fields`` from each kept result.
     """
 
     results_path: str = Field(
@@ -71,6 +86,15 @@ class MCPResultShaping(BaseModel):
         ge=1,
         description="If set, hard cap on the number of shaped results kept (a cap, not a quota).",
     )
+    drop_fields: Optional[List[str]] = Field(
+        default=None,
+        description="If set, recursively remove any dict key whose NAME is in this list from "
+        "each kept result, at any depth (nesting-agnostic; matches by exact name, not path). "
+        "Removing a key drops its whole subtree, so a short list clears large nested metadata "
+        "(e.g. 'history', '_links', '_expandable'). Lossy by design; unset keeps all fields. "
+        "Protected keys (see PROTECTED_PRUNE_KEYS, plus this tool's results_path/type_field) "
+        "are rejected at load and cannot be dropped.",
+    )
 
     @field_validator("results_path")
     @classmethod
@@ -90,6 +114,31 @@ class MCPResultShaping(BaseModel):
                 "tool's own results key (e.g. 'results')."
             )
         return value
+
+    @model_validator(mode="after")
+    def reject_protected_drop_fields(self) -> "MCPResultShaping":
+        """Refuse to prune keys that downstream consumers depend on.
+
+        ``drop_fields`` matches by name at any depth, so a careless or mistyped entry
+        (e.g. ``url``, ``title``, the tool's own ``results_path``) would silently strip
+        the identity/link/snippet fields citation extraction copies off each result, or
+        the ``type_field`` that ``include_types`` filters on - with no error and no trace,
+        just missing citations at runtime. Reject those at load instead, mirroring the
+        fail-fast guard on ``results_path``. The protected set is ``PROTECTED_PRUNE_KEYS``
+        plus this instance's own ``results_path``/``type_field``.
+        """
+        if not self.drop_fields:
+            return self
+        protected = PROTECTED_PRUNE_KEYS | {self.results_path, self.type_field}
+        collisions = sorted(protected.intersection(self.drop_fields))
+        if collisions:
+            raise ValueError(
+                f"result_shaping.drop_fields may not include protected key(s) {collisions}: "
+                "these carry the identity/link/snippet content that citation extraction and "
+                "include_types filtering rely on. Prune only verbose metadata (e.g. 'history', "
+                "'_links', '_expandable')."
+            )
+        return self
 
 
 class MCPToolConfig(BaseModel):

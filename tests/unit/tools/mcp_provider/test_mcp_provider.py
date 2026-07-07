@@ -1,7 +1,9 @@
 """Unit tests for MCP tool provider."""
 
 import json
+import logging
 import os
+from collections import Counter
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -884,8 +886,9 @@ class TestMCPToolProviderAsync:
         assert result["status"] == "success"
         assert result["results"] == payload["results"]
         assert result["total"] == 1
-        # Raw text is preserved alongside the hoisted keys.
-        assert result["text"] == json.dumps(payload)
+        # No reserved-key collision, so the now-redundant raw text is dropped: the hoisted
+        # top-level keys fully represent the payload.
+        assert "text" not in result
 
     @pytest.mark.asyncio
     async def test_call_mcp_tool_skips_hoist_when_structured_content_present(self):
@@ -959,15 +962,15 @@ class TestMCPToolProviderAsync:
 
         # Out-of-scope "issue" dropped from the hoisted, citation-facing results.
         assert [r["type"] for r in result["results"]] == ["page", "page"]
-        # The raw text blob the LLM sees is rewritten to the same shaped set...
-        reserialized = json.loads(result["text"])
-        assert reserialized["results"] == result["results"]
-        # ...while non-results keys are preserved.
-        assert reserialized["total"] == 3
+        # Non-results keys are still hoisted.
+        assert result["total"] == 3
+        # No reserved-key collision, so the redundant raw text is dropped after the shaped
+        # set is hoisted (the shaped keys are the only representation the LLM sees).
+        assert "text" not in result
 
     @pytest.mark.asyncio
     async def test_call_mcp_tool_leaves_results_untouched_without_shaping_config(self):
-        """A tool with no result_shaping config keeps every result and the raw text."""
+        """A tool with no result_shaping config keeps every result (unshaped)."""
         config = MCPServerConfig(command="test")
         provider = MCPToolProvider(server_name="atlassian_rovo_mcp", server_config=config)
         payload = {"results": [_result("page", 1), _result("issue", 1)]}
@@ -977,8 +980,11 @@ class TestMCPToolProviderAsync:
 
         result = await provider._call_mcp_tool("searchAtlassian", {})
 
+        # Results are not shaped (no config), but the redundant raw text is still dropped
+        # on the hoist path since there is no reserved-key collision (dedup is a general
+        # hoist-path invariant, independent of result_shaping).
         assert result["results"] == payload["results"]
-        assert result["text"] == json.dumps(payload)
+        assert "text" not in result
 
     @pytest.mark.asyncio
     async def test_call_mcp_tool_does_not_shape_structured_content(self):
@@ -1006,6 +1012,61 @@ class TestMCPToolProviderAsync:
         result = await provider._call_mcp_tool("searchAtlassian", {})
 
         assert [r["type"] for r in result["data"]["results"]] == ["page", "issue"]
+
+    @pytest.mark.asyncio
+    async def test_call_mcp_tool_keeps_text_on_reserved_key_collision(self):
+        """A hoisted payload with a reserved-named top-level key keeps its raw text.
+
+        Such a key (here a payload-level ``data``) is skipped by the hoist guard and would
+        survive ONLY in text, so text must not be dropped.
+        """
+        config = MCPServerConfig(command="test")
+        provider = MCPToolProvider(server_name="atlassian", server_config=config)
+        payload = {"results": [{"title": "T"}], "data": {"nested": 1}}
+        provider._session = self._make_session(
+            structured_content=None, text=json.dumps(payload)
+        )
+
+        result = await provider._call_mcp_tool("searchConfluenceUsingCql", {})
+
+        assert result["results"] == [{"title": "T"}]
+        # "data" is reserved -> not hoisted -> lives only in text -> text preserved.
+        assert "data" not in result
+        assert result["text"] == json.dumps(payload)
+
+    @pytest.mark.asyncio
+    async def test_call_mcp_tool_prunes_drop_fields_end_to_end(self):
+        """drop_fields recursively strips noise from the hoisted, citation-facing results."""
+        config = MCPServerConfig(
+            command="test",
+            tools={
+                "searchAtlassian": MCPToolConfig(
+                    result_shaping=MCPResultShaping(drop_fields=["_links", "history"])
+                )
+            },
+        )
+        provider = MCPToolProvider(server_name="atlassian_rovo_mcp", server_config=config)
+        payload = {
+            "results": [
+                {
+                    "content": {
+                        "id": "1",
+                        "type": "page",
+                        "history": {"createdBy": {"email": "x"}},
+                    },
+                    "title": "T",
+                    "_links": {"self": "u"},
+                }
+            ]
+        }
+        provider._session = self._make_session(
+            structured_content=None, text=json.dumps(payload)
+        )
+
+        result = await provider._call_mcp_tool("searchAtlassian", {})
+
+        assert result["results"] == [{"content": {"id": "1", "type": "page"}, "title": "T"}]
+        assert "text" not in result
 
 
 def _result(type_: str, index: int) -> dict:
@@ -1191,3 +1252,174 @@ class TestMCPResultShaping:
         # The default and ordinary domain keys pass validation unchanged.
         assert MCPResultShaping().results_path == "results"
         assert MCPResultShaping(results_path="items").results_path == "items"
+
+    def test_drop_fields_prunes_nested_by_name(self):
+        # Nested CQL-like shape: drop by key name at ANY depth; the whole subtree goes.
+        shaping = MCPResultShaping(drop_fields=["history", "_links", "_expandable"])
+        parsed = {
+            "results": [
+                {
+                    "content": {
+                        "id": "1",
+                        "type": "page",
+                        "history": {"createdBy": {"email": "x"}, "_links": {"self": "u"}},
+                        "_expandable": {"body": ""},
+                        "_links": {"webui": "/x"},
+                    },
+                    "title": "T",
+                    "url": "/u",
+                }
+            ]
+        }
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        assert parsed["results"] == [
+            {"content": {"id": "1", "type": "page"}, "title": "T", "url": "/u"}
+        ]
+
+    def test_drop_fields_prunes_flat_shape(self):
+        # Flat searchAtlassian-like shape: the same name list prunes top-level noise too.
+        shaping = MCPResultShaping(drop_fields=["iconCssClass", "breadcrumbs"])
+        parsed = {"results": [{"id": "1", "type": "page", "iconCssClass": "aui", "breadcrumbs": []}]}
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        assert parsed["results"] == [{"id": "1", "type": "page"}]
+
+    def test_drop_fields_only_reports_change_without_filter_or_cap(self):
+        # Prune-only (no include_types/max_results): must still report changed so the raw
+        # text blob is rewritten to match. Guards the pre-prune change-detection ordering.
+        shaping = MCPResultShaping(drop_fields=["_links"])
+        parsed = {"results": [{"id": "1", "_links": {"self": "u"}}]}
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        assert parsed["results"] == [{"id": "1"}]
+
+    def test_drop_fields_noop_when_no_names_match(self):
+        # No key matches -> no change reported (text left intact).
+        shaping = MCPResultShaping(drop_fields=["history"])
+        parsed = {"results": [{"id": "1", "title": "T"}]}
+
+        assert MCPToolProvider._apply_result_shaping(parsed, shaping) is False
+        assert parsed["results"] == [{"id": "1", "title": "T"}]
+
+    def test_filter_cap_and_prune_compose(self):
+        # All three levers together: filter to pages, cap 2, prune "_links" from each kept.
+        shaping = MCPResultShaping(
+            include_types=["page"], max_results=2, drop_fields=["_links"]
+        )
+        parsed = {
+            "results": [
+                {"type": "page", "id": "1", "_links": {"a": 1}},
+                {"type": "issue", "id": "2", "_links": {"a": 1}},
+                {"type": "page", "id": "3", "_links": {"a": 1}},
+                {"type": "page", "id": "4", "_links": {"a": 1}},
+            ]
+        }
+
+        applied = MCPToolProvider._apply_result_shaping(parsed, shaping)
+
+        assert applied is True
+        assert parsed["results"] == [{"type": "page", "id": "1"}, {"type": "page", "id": "3"}]
+
+    def test_prune_in_place_recurses_into_lists(self):
+        # The recursive walk descends into list items, not just dict values, and returns a
+        # Counter of the names actually removed (one dropped key == one removal, subtree
+        # included).
+        obj = {"items": [{"_links": 1, "keep": 2}, {"keep": 3}]}
+
+        removed = MCPToolProvider._prune_in_place(obj, {"_links"})
+
+        assert removed == Counter({"_links": 1})
+        assert obj == {"items": [{"keep": 2}, {"keep": 3}]}
+
+    def test_prune_in_place_counts_each_dropped_key_once(self):
+        # A dropped key counts once even though its whole subtree vanishes; multiple
+        # matches at different depths sum per name.
+        obj = {"a": {"_links": {"self": "u", "nested": {"_links": "z"}}}, "_links": 1}
+
+        removed = MCPToolProvider._prune_in_place(obj, {"_links"})
+
+        # Top-level _links (1) + the _links inside "a" (1); the nested _links inside the
+        # dropped subtree is never visited.
+        assert removed == Counter({"_links": 2})
+        assert obj == {"a": {}}
+
+    def test_prune_in_place_tallies_distinct_names(self):
+        # Different dropped names are tracked separately so the caller can log which fields
+        # went, not just how many.
+        obj = {"history": {}, "_links": {}, "nested": {"_links": {}, "keep": 1}}
+
+        removed = MCPToolProvider._prune_in_place(obj, {"history", "_links"})
+
+        assert removed == Counter({"_links": 2, "history": 1})
+        assert obj == {"nested": {"keep": 1}}
+
+    def test_prune_in_place_returns_empty_counter_when_nothing_matches(self):
+        obj = {"id": "1", "title": "T"}
+
+        removed = MCPToolProvider._prune_in_place(obj, {"history"})
+        assert removed == Counter()
+        assert not removed
+        assert obj == {"id": "1", "title": "T"}
+
+    @pytest.mark.parametrize(
+        "protected", ["status", "text", "error", "images", "resources", "data"]
+    )
+    def test_drop_fields_rejects_reserved_response_keys(self, protected):
+        # The protected floor is the envelope-owned RESERVED_RESPONSE_KEYS (structural,
+        # vendor-neutral); dropping one fails fast at config load.
+        with pytest.raises(ValidationError):
+            MCPResultShaping(drop_fields=[protected])
+
+    def test_drop_fields_rejects_default_results_path_and_type_field(self):
+        # The default results_path ("results") and type_field ("type") are protected via
+        # the validator's per-instance addition, not the static floor.
+        with pytest.raises(ValidationError):
+            MCPResultShaping(drop_fields=["results"])
+        with pytest.raises(ValidationError):
+            MCPResultShaping(drop_fields=["type"])
+
+    def test_drop_fields_rejects_configured_results_path_and_type_field(self):
+        # The protection tracks the tool's OWN configured names, not literals.
+        with pytest.raises(ValidationError):
+            MCPResultShaping(results_path="items", drop_fields=["items"])
+        with pytest.raises(ValidationError):
+            MCPResultShaping(type_field="kind", drop_fields=["kind"])
+
+    def test_drop_fields_allows_consumer_convention_fields(self):
+        # Consumer-convention fields (url/title/id/content/excerpt) are deliberately NOT
+        # protected: the floor is structural only, so a tool may prune them if it wants.
+        shaping = MCPResultShaping(
+            drop_fields=["id", "title", "url", "excerpt", "content"]
+        )
+        assert shaping.drop_fields == ["id", "title", "url", "excerpt", "content"]
+
+    def test_drop_fields_error_names_every_collision(self):
+        # The error enumerates all colliding keys so a config author sees them at once.
+        with pytest.raises(ValidationError, match="data.*text"):
+            MCPResultShaping(drop_fields=["history", "text", "data"])
+
+    def test_apply_result_shaping_logs_prune_and_cap_at_info(self, caplog):
+        # Pruning/capping are silent + lossy, so shaping emits an INFO breadcrumb of what
+        # it removed (result count kept and fields pruned), tagged with the tool name.
+        shaping = MCPResultShaping(max_results=1, drop_fields=["_links"])
+        parsed = {"results": [{"id": "1", "_links": {}}, {"id": "2", "_links": {}}]}
+
+        with caplog.at_level(logging.INFO, logger="redis_sre_agent.tools.mcp.provider"):
+            applied = MCPToolProvider._apply_result_shaping(parsed, shaping, "searchThing")
+
+        assert applied is True
+        record = next(
+            r for r in caplog.records if "result_shaping on 'searchThing'" in r.message
+        )
+        assert record.levelno == logging.INFO
+        # The log reports the fields ACTUALLY dropped, not the configured denylist: only
+        # the one kept result was pruned, so the tally is {'_links': 1}, not 2.
+        assert "kept 1/2" in record.message
+        assert "pruned 1 field(s) {'_links': 1}" in record.message
