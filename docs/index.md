@@ -23,6 +23,7 @@ Redis SRE Agent gives platform teams an AI operator for Redis. It answers Redis 
 - Agent Memory Server integration: [how-to/agent-memory-server-integration.md](how-to/agent-memory-server-integration.md)
 - Scheduled health checks: [how-to/cli.md#7-schedule-recurring-checks](how-to/cli.md#7-schedule-recurring-checks)
 - Provider and MCP integration: [how-to/tool-providers.md](how-to/tool-providers.md)
+- Confluence as a live knowledge source: [how-to/confluence-knowledge-source.md](how-to/confluence-knowledge-source.md)
 - Knowledge ingestion and search: [how-to/pipelines.md](how-to/pipelines.md)
 
 ## What a successful first run looks like

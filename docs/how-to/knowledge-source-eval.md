@@ -28,9 +28,10 @@ docker compose exec -T sre-agent uv run redis-sre-agent pipeline ingest
 ```
 
 For multi-source retrieval, also wire the Atlassian MCP server into `config.yaml`
-(see the MCP section there). With no MCP source configured, the agent answers
-from the RAG index alone - useful as a single-source point of comparison, but
-Phase 2's multi-source assertion will not pass.
+(see [Confluence as a live knowledge source](confluence-knowledge-source.md)).
+With no MCP source configured, the agent answers from the RAG index alone -
+useful as a single-source point of comparison, but Phase 2's multi-source
+assertion will not pass.
 
 ## Canonical question set
 

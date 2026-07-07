@@ -44,6 +44,7 @@ nav:
   - How-to:
       - Agent Memory Server Integration: how-to/agent-memory-server-integration.md
       - How to connect to Redis: how-to/connect-to-redis.md
+      - Confluence knowledge source: how-to/confluence-knowledge-source.md
       - Configuration: how-to/configuration.md
       - Eval system: how-to/evals.md
       - Knowledge source eval: how-to/knowledge-source-eval.md

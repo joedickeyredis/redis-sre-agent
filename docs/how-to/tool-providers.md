@@ -149,4 +149,83 @@ tool_manager = ToolManager(
 )
 ```
 
+### Customizing tool descriptions
+
+Override a tool's description to steer how the model uses it, or use `{original}` to keep the server's own description and frame it with your own text. This is useful when an upstream description is generic and you want the model to treat the tool a specific way (for example, as a documentation source rather than generic search).
+
+```yaml
+mcp_servers:
+  my-server:
+    url: ...
+    tools:
+      search:
+        # {original} expands to the server's own description; your text frames it.
+        description: "Search the internal engineering knowledge base. {original}"
+```
+
+If you omit `{original}`, your text fully replaces the upstream description.
+
+### Tool capability and action kind
+
+Tag each MCP tool so the agent routes and gates it correctly:
+
+- `capability` groups the tool into a category (`knowledge`, `metrics`, `tickets`, `repos`, and so on). MCP tools default to `utilities`, which tells the agent they are lightweight helpers. Set `capability: knowledge` on documentation/search tools so they are treated as a knowledge source and become eligible for citations.
+- `action_kind: read` marks the tool as a safe read, so it is auto-allowed (no approval prompt) and cacheable.
+
+```yaml
+tools:
+  search:
+    capability: knowledge
+    action_kind: read
+```
+
+### Pinning call-time arguments (arg_defaults)
+
+Some tools require a fixed deployment identifier the model cannot know and should not choose - a cloud, tenant, account, or region id. `arg_defaults` supplies these at call time from your environment. When a value resolves to a concrete value it is removed from the tool's advertised schema (so the model never sees it or stalls asking the user for it) and injected on every call; unresolved placeholders are left in the schema so the model can still supply them.
+
+```yaml
+tools:
+  search:
+    arg_defaults:
+      # Resolved from .env, hidden from the model, sent on every call.
+      cloudId: ${ATLASSIAN_CLOUD_ID}
+```
+
+Values use the same `${VAR}` expansion as `headers` and `env`. This is generic - reuse it for any MCP tool that needs a pinned deployment argument.
+
+### Shaping tool results (result_shaping)
+
+Live search tools often return many mixed, verbose results - more than the model needs and noisier than you want in citations. `result_shaping` curates each result set on the client, before it reaches the model or citations. All fields are optional:
+
+| Field | Effect |
+|-------|--------|
+| `include_types` | Keep only results whose type is in this list (drops out-of-scope kinds). |
+| `max_results` | Cap the number of results (applied after `include_types`). |
+| `drop_fields` | Remove these keys by name, at any depth, from each result to strip verbose metadata. |
+| `results_path` | Top-level key holding the list of results (default `results`). Override if the tool nests its results under a different key. |
+| `type_field` | Field on each result that `include_types` matches against (default `type`). Override if the tool names its kind field differently. |
+
+The defaults for `results_path` and `type_field` fit most tools, so you usually only set `include_types`/`max_results`/`drop_fields`. If the tool's payload does not match `results_path` (key absent or not a list), shaping is a safe no-op.
+
+```yaml
+tools:
+  search:
+    result_shaping:
+      include_types: [page, blogpost]              # keep docs, drop other kinds
+      max_results: 8                               # cap the count
+      drop_fields: [history, _links, _expandable]  # prune noisy metadata subtrees
+```
+
+Shaping is opt-in per tool: only tools that declare `result_shaping` are touched, and an unrecognized result shape is left unchanged (it never drops data on a mismatch).
+
+The fields apply in a fixed order: filter, then cap, then prune.
+
+```mermaid
+flowchart LR
+  raw["Raw results at results_path"] --> filter["Filter by include_types<br>(match type_field)"]
+  filter --> cap["Keep first max_results"]
+  cap --> prune["Prune drop_fields<br>from each kept result"]
+  prune --> out["Shaped results to model + citations"]
+```
+
 See `config.yaml.example` for full YAML MCP configuration examples.
