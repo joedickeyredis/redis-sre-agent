@@ -5,6 +5,7 @@ and exposes its tools to the agent. It supports tool filtering and description
 overrides based on the MCPServerConfig.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -259,12 +260,22 @@ class MCPToolProvider(ToolProvider):
                 f"{[t.name for t in self._mcp_tools]}"
             )
 
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
+            # A failed remote connection can surface as CancelledError (a
+            # BaseException), so catch it too and always tear down. Guard the
+            # teardown so its errors can't mask the original failure; re-raise
+            # for the caller's graceful-degradation handler.
             logger.error(f"Failed to connect to MCP server '{self._server_name}': {e}")
-            # Clean up on failure
             if self._exit_stack:
-                await self._exit_stack.aclose()
-                self._exit_stack = None
+                try:
+                    await self._exit_stack.aclose()
+                except BaseException as cleanup_err:
+                    logger.debug(
+                        f"Error tearing down MCP connection for '{self._server_name}': "
+                        f"{cleanup_err}"
+                    )
+                finally:
+                    self._exit_stack = None
             raise
 
     async def _disconnect(self) -> None:

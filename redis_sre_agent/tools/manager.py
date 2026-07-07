@@ -7,6 +7,7 @@ This module provides the ToolManager class which handles:
 4. Routing LLM tool calls to the correct provider
 """
 
+import asyncio
 import logging
 import shutil
 from contextlib import AsyncExitStack
@@ -711,6 +712,22 @@ class ToolManager:
 
             except FileNotFoundError as e:
                 logger.warning(f"Failed to load MCP provider '{server_name}': {e}")
+                # Don't fail entire manager if one MCP provider fails
+            except asyncio.CancelledError:
+                # A remote MCP connection failure (e.g. a network/auth error in the
+                # anyio streamable-HTTP task group) can surface as CancelledError
+                # rather than a normal Exception. Honor genuine cooperative
+                # cancellation, but otherwise degrade gracefully: skip this provider
+                # so a remote outage (e.g. Confluence) falls back to the remaining
+                # tools instead of failing the whole turn.
+                current = asyncio.current_task()
+                cancelling = getattr(current, "cancelling", lambda: 0)() if current else 0
+                if cancelling > 0:
+                    raise
+                logger.error(
+                    f"Failed to load MCP provider '{server_name}': connection aborted; "
+                    "treating server as unavailable"
+                )
                 # Don't fail entire manager if one MCP provider fails
             except Exception as e:
                 logger.error(f"Failed to load MCP provider '{server_name}': {e}")
