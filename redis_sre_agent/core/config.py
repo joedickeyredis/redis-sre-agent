@@ -578,6 +578,12 @@ class Settings(BaseSettings):
         default=100, description="LangGraph recursion limit for complex workflows"
     )
     tool_timeout: int = Field(default=60, description="Tool execution timeout")
+    mcp_connect_timeout: float = Field(
+        default=10.0,
+        description="Timeout in seconds for establishing a connection to an MCP server "
+        "during connection-pool startup. On timeout the server is treated as unavailable "
+        "and startup continues with the remaining sources.",
+    )
     agent_permission_mode: Literal["read_only", "read_write"] = Field(
         default="read_only",
         description="Global tool execution mode for HITL enforcement. "

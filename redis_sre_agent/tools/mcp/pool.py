@@ -90,6 +90,7 @@ class MCPConnectionPool:
             self._started = True
             return {}
 
+        connect_timeout = settings.mcp_connect_timeout
         results: Dict[str, bool] = {}
         for server_name, server_config in mcp_servers.items():
             if isinstance(server_config, dict):
@@ -97,9 +98,29 @@ class MCPConnectionPool:
             self._configs[server_name] = server_config
 
             try:
-                await self._connect_server(server_name, server_config)
+                # Bound the connect so an unreachable/hanging server (network or auth
+                # failure) can't stall startup indefinitely; on timeout wait_for raises
+                # TimeoutError, handled below as a normal connection failure.
+                await asyncio.wait_for(
+                    self._connect_server(server_name, server_config),
+                    timeout=connect_timeout,
+                )
                 results[server_name] = True
                 logger.info(f"MCP pool: connected to '{server_name}'")
+            except asyncio.CancelledError:
+                # A remote connection failure can surface as CancelledError (rather than
+                # a normal Exception) from the anyio streamable-HTTP task group. Honor
+                # genuine cooperative cancellation, but otherwise degrade gracefully so a
+                # remote outage falls back to the remaining sources instead of aborting
+                # startup (mirrors ToolManager._load_mcp_providers).
+                current = asyncio.current_task()
+                cancelling = getattr(current, "cancelling", lambda: 0)() if current else 0
+                if cancelling > 0:
+                    raise
+                results[server_name] = False
+                logger.error(
+                    f"MCP pool: connection to '{server_name}' aborted; treating as unavailable"
+                )
             except Exception as e:
                 results[server_name] = False
                 logger.error(f"MCP pool: failed to connect to '{server_name}': {e}")
@@ -162,8 +183,18 @@ class MCPConnectionPool:
             )
             self._connections[server_name] = conn
             return conn
-        except Exception:
-            await exit_stack.aclose()
+        except BaseException:
+            # Release the partially-entered stack on ANY failure, including a
+            # CancelledError raised when a connect timeout cancels this coroutine.
+            # Guard the cleanup so an anyio/cross-task teardown error can't mask the
+            # original failure being propagated.
+            try:
+                await exit_stack.aclose()
+            except Exception:
+                logger.debug(
+                    f"Error during aborted-connect cleanup for '{server_name}'",
+                    exc_info=True,
+                )
             raise
 
     def get_connection(self, server_name: str) -> Optional[PooledConnection]:

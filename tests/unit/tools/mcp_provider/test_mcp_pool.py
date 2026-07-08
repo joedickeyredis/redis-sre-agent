@@ -71,14 +71,16 @@ class TestMCPConnectionPool:
         # Mock the settings to return one server
         with patch("redis_sre_agent.core.config.settings") as mock_settings:
             mock_settings.mcp_servers = {"test-server": mock_config}
+            mock_settings.mcp_connect_timeout = 10.0
 
-            # Mock the connection method
-            with patch.object(pool, "_connect_server") as mock_connect:
-                mock_connect.return_value = True
+            # Mock the connection method (awaitable: start() wraps it in wait_for)
+            with patch.object(
+                pool, "_connect_server", new=AsyncMock(return_value=True)
+            ) as mock_connect:
                 status = await pool.start()
 
         assert status == {"test-server": True}
-        mock_connect.assert_called_once_with("test-server", mock_config)
+        mock_connect.assert_awaited_once_with("test-server", mock_config)
 
     @pytest.mark.asyncio
     async def test_start_prefers_eval_scoped_server_overrides(self):
@@ -90,6 +92,7 @@ class TestMCPConnectionPool:
             mock_settings.mcp_servers = {
                 "global-server": MCPServerConfig(url="https://global.example/mcp")
             }
+            mock_settings.mcp_connect_timeout = 10.0
 
             with patch.object(
                 pool, "_connect_server", new=AsyncMock(return_value=True)
